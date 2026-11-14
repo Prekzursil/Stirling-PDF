@@ -54,6 +54,10 @@ jobs:
       - name: Setup Gradle
         if: matrix.language == 'java-kotlin'
         uses: gradle/actions/setup-gradle@v6
+        with:
+          # A restored build cache would mark every task UP-TO-DATE and the
+          # traced build would compile nothing, leaving CodeQL with zero Java.
+          cache-disabled: true
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
@@ -66,7 +70,7 @@ jobs:
         if: matrix.language == 'java-kotlin'
         env:
           STIRLING_FLAVOR: core
-        run: ./gradlew assemble --no-daemon -PnoSpotless
+        run: ./gradlew assemble --no-daemon --no-build-cache -PnoSpotless
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
