@@ -36,8 +36,10 @@ jobs:
             build-mode: manual
           - language: javascript-typescript
             build-mode: none
+          # Rust only supports build-mode "none" in CodeQL (standalone
+          # extraction); "manual" is rejected by database init.
           - language: rust
-            build-mode: manual
+            build-mode: none
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -55,19 +57,6 @@ jobs:
           STIRLING_FLAVOR: core
         run: |
           ./gradlew assemble --no-daemon -PnoSpotless
-
-      - name: Install Tauri system dependencies (Rust)
-        if: matrix.language == 'rust'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
-
-      - name: Build Tauri editor (Rust, traced by CodeQL)
-        if: matrix.language == 'rust'
-        working-directory: frontend/editor/src-tauri
-        run: cargo build
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4

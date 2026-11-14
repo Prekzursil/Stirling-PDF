@@ -11,6 +11,10 @@ permissions:
 
 jobs:
   labeler:
+    # This fork does not have the labeling GitHub App installed, so the bot
+    # secrets are empty here; skip instead of failing every PR. Upstream
+    # (with the App configured) is unaffected by this guard.
+    if: ${{ secrets.GH_APP_ID != '' }}
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
