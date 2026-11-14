@@ -1,0 +1,74 @@
+# Advanced Code Scanning (CodeQL) — fleet security standard.
+# security-extended + security-and-quality strictly subsumes the default suite
+# and the extended suite. Matrix covers every language this repository has:
+# java-kotlin (Gradle backend), javascript-typescript (frontend + devTools),
+# rust (Tauri desktop app in frontend/src-tauri). The repository's own suite
+# (Build and Test Workflow router) stays wired in CI beside this workflow.
+name: CodeQL Advanced
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "33 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      # required for all features
+      security-events: write
+      # only required for workflows in private repositories
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: java-kotlin
+            build-mode: manual
+          - language: javascript-typescript
+            build-mode: none
+          # Rust only supports build-mode "none" in CodeQL (standalone
+          # extraction); "manual" is rejected by database init.
+          - language: rust
+            build-mode: none
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 25
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@v5
+        with:
+          java-version: "25"
+          distribution: temurin
+
+      - name: Setup Gradle
+        if: matrix.language == 'java-kotlin'
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended,security-and-quality
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Build backend (Java, traced by CodeQL)
+        if: matrix.language == 'java-kotlin'
+        env:
+          STIRLING_FLAVOR: core
+        run: ./gradlew assemble --no-daemon -PnoSpotless
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
