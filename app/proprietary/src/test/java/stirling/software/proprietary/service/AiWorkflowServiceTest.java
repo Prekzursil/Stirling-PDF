@@ -2,6 +2,7 @@ package stirling.software.proprietary.service;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -20,11 +21,13 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -78,6 +81,7 @@ class AiWorkflowServiceTest {
     private static final String SPLIT_ENDPOINT = "/api/v1/general/split-pages";
     private static final String MERGE_ENDPOINT = "/api/v1/general/merge-pdfs";
     private static final String COMPRESS_ENDPOINT = "/api/v1/misc/compress-pdf";
+    private static final String MARKDOWN_ENDPOINT = "/api/v1/convert/pdf/markdown";
 
     @Mock private CustomPDFDocumentFactory pdfDocumentFactory;
     @Mock private AiEngineClient aiEngineClient;
@@ -110,7 +114,11 @@ class AiWorkflowServiceTest {
 
         PolicyExecutor policyExecutor =
                 new PolicyExecutor(
-                        internalApiClient, toolMetadataService, tempFileManager, objectMapper);
+                        internalApiClient,
+                        toolMetadataService,
+                        tempFileManager,
+                        objectMapper,
+                        new ApplicationProperties());
         service =
                 new AiWorkflowService(
                         pdfDocumentFactory,
@@ -149,6 +157,25 @@ class AiWorkflowServiceTest {
         assertEquals("file-1", result.getResultFiles().get(0).getFileId());
         assertEquals(1, ids.get());
         verify(internalApiClient, times(1)).post(eq(ROTATE_ENDPOINT), any());
+    }
+
+    @Test
+    void toolCallDeletesItsCopiesOfTheInputs() throws IOException {
+        stubOrchestrator(
+                """
+                {"outcome":"tool_call","tool":"%s","parameters":{"angle":90},"rationale":"Rotating"}
+                """
+                        .formatted(ROTATE_ENDPOINT));
+        when(toolMetadataService.isMultiInput(ROTATE_ENDPOINT)).thenReturn(false);
+        when(toolMetadataService.shouldUnpackZipResponse(ROTATE_ENDPOINT)).thenReturn(false);
+        stubEndpoint(ROTATE_ENDPOINT, pdfResource("rotated-bytes", "rotated.pdf"));
+        stubFileStorage();
+
+        service.orchestrate(requestFor(pdf("input.pdf", "original-pdf-bytes"), "rotate 90"));
+
+        try (Stream<Path> left = Files.list(tempDir)) {
+            assertTrue(left.noneMatch(path -> path.toString().endsWith("ai-workflow")));
+        }
     }
 
     @Test
@@ -229,6 +256,57 @@ class AiWorkflowServiceTest {
         // 1:1 mapping preserves each input's filename.
         assertEquals("a.pdf", result.getResultFiles().get(0).getFileName());
         assertEquals("b.pdf", result.getResultFiles().get(1).getFileName());
+        // Each output points back at the input it came from so the client versions it in place.
+        assertEquals(0, result.getResultFiles().get(0).getSourceIndex());
+        assertEquals(1, result.getResultFiles().get(1).getSourceIndex());
+    }
+
+    @Test
+    void mergeOutputHasNoSourceIndex() throws IOException {
+        MockMultipartFile a = pdf("a.pdf", "a-bytes");
+        MockMultipartFile b = pdf("b.pdf", "b-bytes");
+        stubOrchestrator(
+                """
+                {"outcome":"tool_call","tool":"%s","parameters":{},"rationale":"Merging"}
+                """
+                        .formatted(MERGE_ENDPOINT));
+        when(toolMetadataService.isMultiInput(MERGE_ENDPOINT)).thenReturn(true);
+        when(toolMetadataService.shouldUnpackZipResponse(MERGE_ENDPOINT)).thenReturn(false);
+        stubEndpoint(MERGE_ENDPOINT, pdfResource("merged-bytes", "merged.pdf"));
+        stubFileStorage();
+
+        AiWorkflowResponse result =
+                service.orchestrate(requestFor(new MockMultipartFile[] {a, b}, "merge these"));
+
+        // A merge draws on several inputs, so there is no single source to version in place.
+        assertNull(result.getResultFiles().get(0).getSourceIndex());
+    }
+
+    @Test
+    void splitOutputsHaveNoSourceIndex() throws IOException {
+        MockMultipartFile input = pdf("doc.pdf", "original");
+        stubOrchestrator(
+                """
+                {"outcome":"tool_call","tool":"%s","parameters":{},"rationale":"Splitting"}
+                """
+                        .formatted(SPLIT_ENDPOINT));
+        when(toolMetadataService.isMultiInput(SPLIT_ENDPOINT)).thenReturn(false);
+        when(toolMetadataService.shouldUnpackZipResponse(SPLIT_ENDPOINT)).thenReturn(true);
+        stubEndpoint(
+                SPLIT_ENDPOINT,
+                zipResource(
+                        "doc.zip",
+                        List.of(
+                                new ZipEntryBytes("page-1.pdf", "page-one"),
+                                new ZipEntryBytes("page-2.pdf", "page-two"))));
+        stubFileStorage();
+
+        AiWorkflowResponse result = service.orchestrate(requestFor(input, "split"));
+
+        // One input fanned out to many outputs, so none is a clean 1:1 version — the client adds
+        // them as fresh files and leaves the original in place.
+        assertNull(result.getResultFiles().get(0).getSourceIndex());
+        assertNull(result.getResultFiles().get(1).getSourceIndex());
     }
 
     @Test
@@ -264,52 +342,52 @@ class AiWorkflowServiceTest {
 
     @Test
     void parameterListOfStructuredObjectsIsJsonEncodedAsSingleField() throws IOException {
-        // Endpoints like /general/edit-text and /security/redact bind a List<StructuredObject>
-        // from a single JSON form field via a property editor. The plan executor must
-        // pre-serialize such lists rather than splitting them into repeated form fields.
-        String editTextEndpoint = "/api/v1/general/edit-text";
+        // Endpoints like /security/redact bind a List<StructuredObject> from a single JSON form
+        // field via a property editor. The plan executor must pre-serialize such lists rather
+        // than splitting them into repeated form fields.
+        String redactEndpoint = "/api/v1/security/redact";
         MockMultipartFile input = pdf("input.pdf", "bytes");
         stubOrchestrator(
                 """
                 {
                   "outcome":"plan",
-                  "summary":"Find and replace",
+                  "summary":"Redact areas",
                   "steps":[
                     {"tool":"%s","parameters":{
-                      "edits":[{"find":"foo","replace":"bar"},{"find":"baz","replace":"qux"}],
-                      "useRegex":false
+                      "redactions":[{"page":1,"x":10,"y":20,"width":100,"height":50},{"page":2,"x":5,"y":15,"width":80,"height":30}],
+                      "convertPDFToImage":false
                     }}
                   ]
                 }
                 """
-                        .formatted(editTextEndpoint));
-        when(toolMetadataService.isMultiInput(editTextEndpoint)).thenReturn(false);
-        when(toolMetadataService.shouldUnpackZipResponse(editTextEndpoint)).thenReturn(false);
-        stubEndpoint(editTextEndpoint, pdfResource("edited", "edited.pdf"));
+                        .formatted(redactEndpoint));
+        when(toolMetadataService.isMultiInput(redactEndpoint)).thenReturn(false);
+        when(toolMetadataService.shouldUnpackZipResponse(redactEndpoint)).thenReturn(false);
+        stubEndpoint(redactEndpoint, pdfResource("edited", "edited.pdf"));
         stubFileStorage();
 
-        service.orchestrate(requestFor(input, "find and replace"));
+        service.orchestrate(requestFor(input, "redact areas"));
 
         @SuppressWarnings("unchecked")
         ArgumentCaptor<MultiValueMap<String, Object>> bodyCaptor =
                 ArgumentCaptor.forClass(MultiValueMap.class);
-        verify(internalApiClient).post(eq(editTextEndpoint), bodyCaptor.capture());
+        verify(internalApiClient).post(eq(redactEndpoint), bodyCaptor.capture());
         MultiValueMap<String, Object> body = bodyCaptor.getValue();
 
         // The structured-list field must be serialized as ONE JSON-string entry, not multiple
         // entries.
-        List<Object> editsValues = body.get("edits");
-        assertNotNull(editsValues);
-        assertEquals(1, editsValues.size());
+        List<Object> redactionsValues = body.get("redactions");
+        assertNotNull(redactionsValues);
+        assertEquals(1, redactionsValues.size());
         assertEquals(
-                "[{\"find\":\"foo\",\"replace\":\"bar\"},{\"find\":\"baz\",\"replace\":\"qux\"}]",
-                editsValues.get(0));
+                "[{\"page\":1,\"x\":10,\"y\":20,\"width\":100,\"height\":50},{\"page\":2,\"x\":5,\"y\":15,\"width\":80,\"height\":30}]",
+                redactionsValues.get(0));
 
         // Primitive fields keep the original behavior (single value, not JSON-wrapped).
-        List<Object> useRegex = body.get("useRegex");
-        assertNotNull(useRegex);
-        assertEquals(1, useRegex.size());
-        assertEquals(false, useRegex.get(0));
+        List<Object> convertPDFToImage = body.get("convertPDFToImage");
+        assertNotNull(convertPDFToImage);
+        assertEquals(1, convertPDFToImage.size());
+        assertEquals(false, convertPDFToImage.get(0));
     }
 
     @Test
@@ -440,23 +518,23 @@ class AiWorkflowServiceTest {
     }
 
     @Test
-    void convertMarkdownRunsDeterministicConversionAndReturnsMdFile() throws IOException {
+    void planWithMarkdownStepReturnsMdFile() throws IOException {
+        // PDF→Markdown is a normal tool the edit agent emits as a plan step (no bespoke
+        // outcome); the plan executor runs the converter and returns the .md file.
         MockMultipartFile input = pdf("multi-column-test_lorem.pdf", "pdf-bytes");
-        when(fileIdStrategy.idFor(any())).thenReturn("doc-1");
         stubOrchestrator(
                 """
                 {
-                  "outcome":"convert_markdown",
-                  "reason":"PDF to Markdown requested.",
-                  "filesToIngest":[{"id":"doc-1","name":"multi-column-test_lorem.pdf"}]
+                  "outcome":"plan",
+                  "summary":"Convert to Markdown",
+                  "steps":[{"tool":"%s","parameters":{}}]
                 }
-                """);
-        when(toolMetadataService.shouldUnpackZipResponse("/api/v1/convert/pdf/markdown"))
-                .thenReturn(false);
-        stubEndpoint(
-                "/api/v1/convert/pdf/markdown",
-                pdfResource("# Title", "multi-column-test_lorem.md"));
-        AtomicInteger ids = stubFileStorage();
+                """
+                        .formatted(MARKDOWN_ENDPOINT));
+        when(toolMetadataService.isMultiInput(anyString())).thenReturn(false);
+        when(toolMetadataService.shouldUnpackZipResponse(anyString())).thenReturn(false);
+        stubEndpoint(MARKDOWN_ENDPOINT, pdfResource("# Title", "multi-column-test_lorem.md"));
+        stubFileStorage();
 
         AiWorkflowResponse result = service.orchestrate(requestFor(input, "convert to markdown"));
 
@@ -464,8 +542,7 @@ class AiWorkflowServiceTest {
         assertEquals(1, result.getResultFiles().size());
         // Extension changes (pdf -> md), so the converter's response filename wins.
         assertEquals("multi-column-test_lorem.md", result.getResultFiles().get(0).getFileName());
-        assertEquals(1, ids.get());
-        verify(internalApiClient, times(1)).post(eq("/api/v1/convert/pdf/markdown"), any());
+        verify(internalApiClient, times(1)).post(eq(MARKDOWN_ENDPOINT), any());
     }
 
     @Test

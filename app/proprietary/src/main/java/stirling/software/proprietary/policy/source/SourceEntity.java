@@ -2,7 +2,12 @@ package stirling.software.proprietary.policy.source;
 
 import java.io.Serializable;
 
+import org.hibernate.annotations.Cache;
+import org.hibernate.annotations.CacheConcurrencyStrategy;
+
+import jakarta.persistence.Cacheable;
 import jakarta.persistence.Column;
+import jakarta.persistence.Convert;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
@@ -10,6 +15,8 @@ import jakarta.persistence.Table;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+
+import stirling.software.proprietary.integration.crypto.LegacyDecryptStringConverter;
 
 /**
  * JPA row for a {@link Source}. The whole source lives as JSON in {@code sourceJson} (authoritative
@@ -19,6 +26,8 @@ import lombok.Setter;
  */
 @Entity
 @Table(name = "policy_sources")
+@Cacheable
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE, region = "policy-sources")
 @NoArgsConstructor
 @Getter
 @Setter
@@ -45,6 +54,9 @@ public class SourceEntity implements Serializable {
     @Column(name = "enabled")
     private boolean enabled;
 
+    // Plaintext at rest: the S3 credentials that used to live here now sit in a referenced
+    // IntegrationConfig connection (still encrypted). Decrypts legacy ciphertext on read.
+    @Convert(converter = LegacyDecryptStringConverter.class)
     @Column(name = "source_json", columnDefinition = "text")
     private String sourceJson;
 }

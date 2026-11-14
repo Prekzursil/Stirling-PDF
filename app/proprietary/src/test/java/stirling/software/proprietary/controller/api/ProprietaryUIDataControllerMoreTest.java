@@ -24,6 +24,7 @@ import org.springframework.security.oauth2.core.user.OAuth2User;
 
 import stirling.software.common.model.ApplicationProperties;
 import stirling.software.common.model.enumeration.Role;
+import stirling.software.proprietary.access.service.ResourceAccessService;
 import stirling.software.proprietary.config.AuditConfigurationProperties;
 import stirling.software.proprietary.controller.api.ProprietaryUIDataController.AccountData;
 import stirling.software.proprietary.controller.api.ProprietaryUIDataController.AdminSettingsData;
@@ -39,6 +40,7 @@ import stirling.software.proprietary.security.database.repository.SessionReposit
 import stirling.software.proprietary.security.database.repository.UserRepository;
 import stirling.software.proprietary.security.model.Authority;
 import stirling.software.proprietary.security.model.User;
+import stirling.software.proprietary.security.repository.TeamMembershipRepository;
 import stirling.software.proprietary.security.repository.TeamRepository;
 import stirling.software.proprietary.security.saml2.CustomSaml2AuthenticatedPrincipal;
 import stirling.software.proprietary.security.service.DatabaseServiceInterface;
@@ -57,12 +59,18 @@ class ProprietaryUIDataControllerMoreTest {
     @Mock private SessionPersistentRegistry sessionPersistentRegistry;
     @Mock private UserRepository userRepository;
     @Mock private TeamRepository teamRepository;
+    @Mock private TeamMembershipRepository teamMembershipRepository;
     @Mock private SessionRepository sessionRepository;
     @Mock private DatabaseServiceInterface databaseService;
     @Mock private UserLicenseSettingsService licenseSettingsService;
     @Mock private PersistentAuditEventRepository auditRepository;
     @Mock private MfaService mfaService;
     @Mock private LoginAttemptService loginAttemptService;
+    @Mock private ResourceAccessService resourceAccessService;
+
+    @Mock
+    private stirling.software.proprietary.security.repository.InviteTokenRepository
+            inviteTokenRepository;
 
     private ApplicationProperties applicationProperties;
     private AuditConfigurationProperties auditConfig;
@@ -87,6 +95,7 @@ class ProprietaryUIDataControllerMoreTest {
                         sessionPersistentRegistry,
                         userRepository,
                         teamRepository,
+                        teamMembershipRepository,
                         sessionRepository,
                         databaseService,
                         objectMapper,
@@ -94,7 +103,11 @@ class ProprietaryUIDataControllerMoreTest {
                         licenseSettingsService,
                         auditRepository,
                         mfaService,
-                        loginAttemptService);
+                        loginAttemptService,
+                        resourceAccessService,
+                        inviteTokenRepository,
+                        org.mockito.Mockito.mock(
+                                stirling.software.proprietary.service.OrgOwnerService.class));
     }
 
     private static User normalUser(Long id, String username) {
@@ -135,7 +148,9 @@ class ProprietaryUIDataControllerMoreTest {
         void singleAdminFirstLogin() {
             User admin = normalUser(1L, "admin");
             admin.setFirstLogin(true);
-            when(userRepository.findAll()).thenReturn(List.of(admin));
+            applicationProperties.getSystem().setSetupCompleted(false);
+            when(userRepository.countByUsernameNot(Role.INTERNAL_API_USER.getRoleId()))
+                    .thenReturn(1L);
             when(userRepository.findByUsernameIgnoreCase("admin")).thenReturn(Optional.of(admin));
 
             ResponseEntity<LoginData> response = controller.getLoginData();
@@ -143,12 +158,45 @@ class ProprietaryUIDataControllerMoreTest {
             LoginData data = response.getBody();
             assertThat(data.isFirstTimeSetup()).isTrue();
             assertThat(data.isShowDefaultCredentials()).isTrue();
+            assertThat(data.isDefaultSignIn()).isTrue();
+        }
+
+        @Test
+        @DisplayName("never signs in by itself once setup is complete")
+        void noDefaultSignInAfterSetup() {
+            User admin = normalUser(1L, "admin");
+            admin.setFirstLogin(true);
+            applicationProperties.getSystem().setSetupCompleted(true);
+            when(userRepository.countByUsernameNot(Role.INTERNAL_API_USER.getRoleId()))
+                    .thenReturn(1L);
+            when(userRepository.findByUsernameIgnoreCase("admin")).thenReturn(Optional.of(admin));
+
+            LoginData data = controller.getLoginData().getBody();
+
+            assertThat(data.isShowDefaultCredentials()).isTrue();
+            assertThat(data.isDefaultSignIn()).isFalse();
+        }
+
+        @Test
+        @DisplayName("never signs in by itself once the admin has set a password")
+        void noDefaultSignInAfterPasswordSet() {
+            User admin = normalUser(1L, "admin");
+            admin.setFirstLogin(false);
+            when(userRepository.countByUsernameNot(Role.INTERNAL_API_USER.getRoleId()))
+                    .thenReturn(1L);
+            when(userRepository.findByUsernameIgnoreCase("admin")).thenReturn(Optional.of(admin));
+
+            LoginData data = controller.getLoginData().getBody();
+
+            assertThat(data.isShowDefaultCredentials()).isFalse();
+            assertThat(data.isDefaultSignIn()).isFalse();
         }
 
         @Test
         @DisplayName("does not flag setup when a normal user exists")
         void normalUserNoSetup() {
-            when(userRepository.findAll()).thenReturn(List.of(normalUser(1L, "bob")));
+            when(userRepository.countByUsernameNot(Role.INTERNAL_API_USER.getRoleId()))
+                    .thenReturn(1L);
 
             ResponseEntity<LoginData> response = controller.getLoginData();
 
@@ -217,6 +265,25 @@ class ProprietaryUIDataControllerMoreTest {
         }
 
         @Test
+        @DisplayName("masks the MFA secret in the returned settings")
+        void masksMfaSecret() {
+            User user = normalUser(4L, "mfauser");
+            user.setSettings(Map.of("mfaEnabled", "true", "mfaSecret", "JBSWY3DPEHPK3PXP"));
+            when(userRepository.findByUsernameIgnoreCaseWithSettings("mfauser"))
+                    .thenReturn(Optional.of(user));
+            lenient().when(mfaService.isMfaEnabled(user)).thenReturn(true);
+            lenient().when(mfaService.isMfaRequired(user)).thenReturn(false);
+            Authentication auth =
+                    new UsernamePasswordAuthenticationToken(user, null, user.getAuthorities());
+
+            ResponseEntity<AccountData> response = controller.getAccountData(auth);
+
+            assertThat(response.getBody().getSettings())
+                    .doesNotContain("JBSWY3DPEHPK3PXP")
+                    .contains("mfaEnabled");
+        }
+
+        @Test
         @DisplayName("resolves a SAML2 principal and flags saml login")
         void saml2Principal() {
             User user = normalUser(3L, "samluser");
@@ -227,7 +294,7 @@ class ProprietaryUIDataControllerMoreTest {
 
             CustomSaml2AuthenticatedPrincipal principal =
                     new CustomSaml2AuthenticatedPrincipal(
-                            "samluser", Map.of(), "nameId", List.of());
+                            "samluser", Map.of(), "nameId", List.of(), "response");
             Authentication auth =
                     new UsernamePasswordAuthenticationToken(principal, null, List.of());
 
@@ -246,11 +313,9 @@ class ProprietaryUIDataControllerMoreTest {
         @DisplayName("aggregates users, teams and license limits")
         void aggregates() {
             User user = normalUser(1L, "bob");
-            when(userRepository.findAllWithTeam())
+            when(userRepository.findAllWithTeamAndAuthorities())
                     .thenReturn(new java.util.ArrayList<>(List.of(user)));
             when(sessionPersistentRegistry.getMaxInactiveInterval()).thenReturn(3600);
-            when(sessionPersistentRegistry.findLatestSession("bob")).thenReturn(Optional.empty());
-            when(userRepository.findByIdWithSettings(1L)).thenReturn(Optional.of(user));
             when(teamRepository.findAll()).thenReturn(List.of());
 
             when(licenseSettingsService.calculateMaxAllowedUsers()).thenReturn(10);
@@ -304,7 +369,7 @@ class ProprietaryUIDataControllerMoreTest {
             team.setName("Engineering");
             when(teamRepository.findById(5L)).thenReturn(Optional.of(team));
             when(userRepository.findAllByTeamId(5L)).thenReturn(List.of());
-            when(userRepository.findAllWithTeam()).thenReturn(List.of());
+            when(userRepository.findAllWithTeamAndAuthorities()).thenReturn(List.of());
             when(sessionRepository.findLatestSessionByTeamId(5L))
                     .thenReturn(Collections.emptyList());
 

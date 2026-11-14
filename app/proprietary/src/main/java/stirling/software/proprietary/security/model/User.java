@@ -2,37 +2,41 @@ package stirling.software.proprietary.security.model;
 
 import java.io.Serializable;
 import java.time.LocalDateTime;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
 import java.util.stream.Collectors;
 
+import org.hibernate.annotations.Cache;
+import org.hibernate.annotations.CacheConcurrencyStrategy;
 import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.NaturalId;
+import org.hibernate.annotations.NaturalIdCache;
 import org.hibernate.annotations.UpdateTimestamp;
+import org.hibernate.proxy.HibernateProxy;
 import org.springframework.security.core.userdetails.UserDetails;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 
 import jakarta.persistence.*;
 
-import lombok.EqualsAndHashCode;
-import lombok.Getter;
-import lombok.NoArgsConstructor;
-import lombok.Setter;
-import lombok.ToString;
+import lombok.*;
 
 import stirling.software.common.model.enumeration.Role;
 import stirling.software.proprietary.model.Team;
 
 @Entity
-@Table(name = "users")
+@Table(
+        name = "users",
+        // team_id backs Team.users joins, the admin roster fetch, and per-team user counts.
+        indexes = @Index(name = "idx_users_team_id", columnList = "team_id"))
+@Cacheable
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE, region = "users")
+// Explicit region: the default EntityName##NaturalId contains '#' which the
+// caffeine-jcache provider cannot resolve (it concatenates the name into an
+// unquoted Typesafe Config path, where '#' starts a comment).
+@NaturalIdCache(region = "usersNaturalId")
 @NoArgsConstructor
 @Getter
 @Setter
-@EqualsAndHashCode(onlyExplicitlyIncluded = true)
 @ToString(onlyExplicitlyIncluded = true)
 public class User implements UserDetails, Serializable {
 
@@ -41,9 +45,10 @@ public class User implements UserDetails, Serializable {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     @Column(name = "user_id")
-    @EqualsAndHashCode.Include
     private Long id;
 
+    // Mutable: changeUsername renames users, so the natural-id mapping must follow renames.
+    @NaturalId(mutable = true)
     @Column(name = "username", unique = true)
     private String username;
 
@@ -94,6 +99,7 @@ public class User implements UserDetails, Serializable {
     @Column(name = "supabase_auth_id", unique = true)
     private UUID supabaseId;
 
+    @Cache(usage = CacheConcurrencyStrategy.READ_WRITE, region = "users")
     @OneToMany(fetch = FetchType.EAGER, cascade = CascadeType.ALL, mappedBy = "user")
     private Set<Authority> authorities = new HashSet<>();
 
@@ -101,9 +107,9 @@ public class User implements UserDetails, Serializable {
     @JoinColumn(name = "team_id")
     private Team team;
 
+    @Cache(usage = CacheConcurrencyStrategy.READ_WRITE, region = "users")
     @ElementCollection
     @MapKeyColumn(name = "setting_key")
-    @Lob
     @Column(name = "setting_value", columnDefinition = "text")
     @CollectionTable(name = "user_settings", joinColumns = @JoinColumn(name = "user_id"))
     @JsonIgnore
@@ -178,5 +184,32 @@ public class User implements UserDetails, Serializable {
 
     public void setOauthGrandfathered(boolean oauthGrandfathered) {
         this.oauthGrandfathered = oauthGrandfathered;
+    }
+
+    @Override
+    public final boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null) return false;
+        Class<?> oEffectiveClass =
+                o instanceof HibernateProxy
+                        ? ((HibernateProxy) o).getHibernateLazyInitializer().getPersistentClass()
+                        : o.getClass();
+        Class<?> thisEffectiveClass =
+                this instanceof HibernateProxy
+                        ? ((HibernateProxy) this).getHibernateLazyInitializer().getPersistentClass()
+                        : this.getClass();
+        if (thisEffectiveClass != oEffectiveClass) return false;
+        User user = (User) o;
+        return getId() != null && Objects.equals(getId(), user.getId());
+    }
+
+    @Override
+    public final int hashCode() {
+        return this instanceof HibernateProxy
+                ? ((HibernateProxy) this)
+                        .getHibernateLazyInitializer()
+                        .getPersistentClass()
+                        .hashCode()
+                : getClass().hashCode();
     }
 }

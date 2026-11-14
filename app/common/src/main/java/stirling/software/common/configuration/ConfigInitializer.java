@@ -32,7 +32,7 @@ public class ConfigInitializer {
 
         long lineCount = settingsFileExists ? Files.readAllLines(destPath).size() : 0;
 
-        log.info("Current settings file line count: {}", lineCount);
+        log.debug("Current settings file line count: {}", lineCount);
 
         if (!settingsFileExists || lineCount < MIN_SETTINGS_FILE_LINES) {
             if (settingsFileExists) {
@@ -80,9 +80,15 @@ public class ConfigInitializer {
 
             migrateEnterpriseEditionToPremium(settingsFile, settingsTemplateFile);
             migrateProFeaturesKeyCasing(settingsFile, settingsTemplateFile);
+            boolean ssoAutoLoginMigrated =
+                    migrateSsoAutoLoginToSecurity(settingsFile, settingsTemplateFile);
+            boolean setupCompletedMigrated =
+                    markExistingServerSetUp(settingsFile, settingsTemplateFile);
 
             boolean changesMade =
-                    settingsTemplateFile.updateValuesFromYaml(settingsFile, settingsTemplateFile);
+                    settingsTemplateFile.updateValuesFromYaml(settingsFile, settingsTemplateFile)
+                            || ssoAutoLoginMigrated
+                            || setupCompletedMigrated;
             if (changesMade) {
                 settingsTemplateFile.save(destPath);
                 log.info("Settings file updated based on template changes.");
@@ -114,11 +120,6 @@ public class ConfigInitializer {
                     List.of("premium", "key"),
                     yaml.getValueByExactKeyPath("enterpriseEdition", "key"));
         }
-        if (yaml.getValueByExactKeyPath("enterpriseEdition", "SSOAutoLogin") != null) {
-            template.updateValue(
-                    List.of("premium", "proFeatures", "ssoAutoLogin"),
-                    yaml.getValueByExactKeyPath("enterpriseEdition", "SSOAutoLogin"));
-        }
         if (yaml.getValueByExactKeyPath("enterpriseEdition", "CustomMetadata", "autoUpdateMetadata")
                 != null) {
             template.updateValue(
@@ -145,16 +146,7 @@ public class ConfigInitializer {
     }
 
     // TODO: Remove post migration
-    // settings.yml.template renamed the two non-camelCase proFeatures keys
-    // ("SSOAutoLogin" -> "ssoAutoLogin", "CustomMetadata" -> "customMetadata") so the whole
-    // settings pipeline is consistent camelCase. The save path (YamlHelper.updateValue) matches
-    // keys case-sensitively, so without this carry-forward an existing install's values written
-    // under the old PascalCase keys would be dropped on upgrade and reset to template defaults.
     void migrateProFeaturesKeyCasing(YamlHelper yaml, YamlHelper template) {
-        Object ssoAutoLogin = yaml.getValueByExactKeyPath("premium", "proFeatures", "SSOAutoLogin");
-        if (ssoAutoLogin != null) {
-            template.updateValue(List.of("premium", "proFeatures", "ssoAutoLogin"), ssoAutoLogin);
-        }
         for (String field : List.of("autoUpdateMetadata", "author", "creator", "producer")) {
             Object value =
                     yaml.getValueByExactKeyPath("premium", "proFeatures", "CustomMetadata", field);
@@ -163,5 +155,31 @@ public class ConfigInitializer {
                         List.of("premium", "proFeatures", "customMetadata", field), value);
             }
         }
+    }
+
+    boolean migrateSsoAutoLoginToSecurity(YamlHelper yaml, YamlHelper template) {
+        if (yaml.getValueByExactKeyPath("security", "ssoAutoLogin") != null) {
+            return false;
+        }
+        for (List<String> path :
+                List.of(
+                        List.of("premium", "proFeatures", "ssoAutoLogin"),
+                        List.of("premium", "proFeatures", "SSOAutoLogin"),
+                        List.of("enterpriseEdition", "ssoAutoLogin"),
+                        List.of("enterpriseEdition", "SSOAutoLogin"))) {
+            Object value = yaml.getValueByExactKeyPath(path.toArray(String[]::new));
+            if (value != null) {
+                return template.updateValue(List.of("security", "ssoAutoLogin"), value);
+            }
+        }
+        return false;
+    }
+
+    /** A settings file from before the wizard lacks setupCompleted: that server is set up. */
+    boolean markExistingServerSetUp(YamlHelper yaml, YamlHelper template) {
+        if (yaml.getValueByExactKeyPath("system", "setupCompleted") != null) {
+            return false;
+        }
+        return template.updateValue(List.of("system", "setupCompleted"), true);
     }
 }

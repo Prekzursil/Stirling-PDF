@@ -25,6 +25,8 @@ import stirling.software.SPDF.model.api.general.MergeMultiplePagesRequest;
 import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.GeneralApi;
 import stirling.software.common.enumeration.ResourceWeight;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.ExceptionUtils;
 import stirling.software.common.util.GeneralFormCopyUtils;
@@ -44,11 +46,12 @@ public class MultiPageLayoutController {
             value = "/multi-page-layout",
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             resourceWeight = ResourceWeight.MEDIUM_WEIGHT)
+    @ToolIO(produces = ToolFormat.PDF)
     @Operation(
             summary = "Merge multiple pages of a PDF document into a single page",
             description =
                     "This operation takes an input PDF file and the number of pages to merge into a"
-                            + " single sheet in the output PDF file. Input:PDF Output:PDF Type:SISO")
+                            + " single sheet in the output PDF file.")
     public ResponseEntity<Resource> mergeMultiplePagesIntoOne(
             @ModelAttribute MergeMultiplePagesRequest request) throws IOException {
 
@@ -68,9 +71,12 @@ public class MultiPageLayoutController {
         switch (mode) {
             case "DEFAULT":
                 pagesPerSheet = request.getPagesPerSheet();
-                if (pagesPerSheet != 2
-                        && pagesPerSheet
-                                != (int) Math.sqrt(pagesPerSheet) * Math.sqrt(pagesPerSheet)) {
+                // 0 is a perfect square, but the sheet loop steps by pagesPerSheet
+                if (pagesPerSheet <= 0
+                        || (pagesPerSheet != 2
+                                && pagesPerSheet
+                                        != (int) Math.sqrt(pagesPerSheet)
+                                                * Math.sqrt(pagesPerSheet))) {
                     throw ExceptionUtils.createIllegalArgumentException(
                             "error.invalidFormat",
                             "Invalid {0} format: {1}",
@@ -344,8 +350,7 @@ public class MultiPageLayoutController {
 
                 return WebResponseUtils.pdfDocToWebResponse(
                         newDocument,
-                        GeneralUtils.generateFilename(
-                                file.getOriginalFilename(), "_multi_page_layout.pdf"),
+                        GeneralUtils.generateFilename(file.getOriginalFilename(), ".pdf"),
                         tempFileManager);
             } // newDocument is closed here
         } // sourceDocument is closed here

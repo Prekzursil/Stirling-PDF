@@ -48,10 +48,13 @@ import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.MiscApi;
 import stirling.software.common.enumeration.ResourceWeight;
 import stirling.software.common.model.ApplicationProperties;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.ApplicationContextProvider;
 import stirling.software.common.util.ExceptionUtils;
 import stirling.software.common.util.GeneralUtils;
+import stirling.software.common.util.LimitedPDFRenderer;
 import stirling.software.common.util.TempFileManager;
 import stirling.software.common.util.WebResponseUtils;
 
@@ -564,10 +567,12 @@ public class ScannerEffectController {
             value = "/scanner-effect",
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             resourceWeight = ResourceWeight.LARGE_WEIGHT)
+    @ToolIO(produces = ToolFormat.PDF)
     @Operation(
             summary = "Apply scanner effect to PDF",
             description =
-                    "Applies various effects to simulate a scanned document, including rotation, noise, and edge softening. Input:PDF Output:PDF Type:SISO")
+                    "Applies various effects to simulate a scanned document, including rotation,"
+                            + " noise, and edge softening.")
     public ResponseEntity<Resource> scannerEffect(
             @Valid @ModelAttribute ScannerEffectRequest request) throws IOException {
         MultipartFile file = request.getFileInput();
@@ -715,8 +720,7 @@ public class ScannerEffectController {
 
                     return WebResponseUtils.pdfDocToWebResponse(
                             outputDocument,
-                            GeneralUtils.generateFilename(
-                                    file.getOriginalFilename(), "_scanner_effect.pdf"),
+                            GeneralUtils.generateFilename(file.getOriginalFilename(), ".pdf"),
                             tempFileManager);
                 }
             }
@@ -737,7 +741,7 @@ public class ScannerEffectController {
 
         private RenderingResources(PDDocument document) {
             this.document = document;
-            this.renderer = new PDFRenderer(document);
+            this.renderer = new LimitedPDFRenderer(document);
             this.renderer.setSubsamplingAllowed(true);
             this.renderer.setImageDownscalingOptimizationThreshold(0.5f);
         }

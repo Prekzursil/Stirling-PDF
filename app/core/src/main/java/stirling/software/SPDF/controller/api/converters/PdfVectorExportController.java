@@ -27,6 +27,11 @@ import stirling.software.SPDF.model.api.converters.PdfVectorExportRequest;
 import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.ConvertApi;
 import stirling.software.common.enumeration.ResourceWeight;
+import stirling.software.common.model.tool.ToolArity;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
+import stirling.software.common.model.tool.ToolIOCase;
+import stirling.software.common.model.tool.ToolIOWhen;
 import stirling.software.common.util.ExceptionUtils;
 import stirling.software.common.util.GeneralUtils;
 import stirling.software.common.util.ProcessExecutor;
@@ -50,11 +55,12 @@ public class PdfVectorExportController {
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             value = "/vector/pdf",
             resourceWeight = ResourceWeight.MEDIUM_WEIGHT)
+    @ToolIO(accepts = ToolFormat.POSTSCRIPT, produces = ToolFormat.PDF)
     @Operation(
-            summary = "Convert PostScript formats to PDF",
+            summary = "Convert PostScript (PS, EPS) to PDF",
             description =
-                    "Converts PostScript vector inputs (PS, EPS, EPSF) to PDF using Ghostscript."
-                            + " Input:PS/EPS Output:PDF Type:SISO")
+                    "Converts PS, EPS and EPSF with Ghostscript; outputFormat is ignored."
+                            + " XPS and PCL are not supported.")
     public ResponseEntity<Resource> convertGhostscriptInputsToPdf(
             @Valid @ModelAttribute PdfVectorExportRequest request) throws Exception {
 
@@ -92,7 +98,7 @@ public class PdfVectorExportController {
             throw e;
         }
 
-        String outputName = GeneralUtils.generateFilename(originalName, "_converted.pdf");
+        String outputName = GeneralUtils.generateFilename(originalName, ".pdf");
         return WebResponseUtils.pdfFileToWebResponse(outputTemp, outputName);
     }
 
@@ -100,11 +106,26 @@ public class PdfVectorExportController {
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             value = "/pdf/vector",
             resourceWeight = ResourceWeight.MEDIUM_WEIGHT)
+    // One case per non-default value of outputFormat; the base covers the default, eps.
+    @ToolIO(
+            produces = ToolFormat.IMAGE,
+            cases = {
+                @ToolIOCase(
+                        when = @ToolIOWhen(param = "outputFormat", matches = "ps"),
+                        produces = ToolFormat.POSTSCRIPT,
+                        arity = ToolArity.SISO),
+                @ToolIOCase(
+                        when = @ToolIOWhen(param = "outputFormat", matches = "pcl"),
+                        produces = ToolFormat.PCL,
+                        arity = ToolArity.SISO),
+                @ToolIOCase(
+                        when = @ToolIOWhen(param = "outputFormat", matches = "xps"),
+                        produces = ToolFormat.XPS,
+                        arity = ToolArity.SISO)
+            })
     @Operation(
             summary = "Convert PDF to vector format",
-            description =
-                    "Converts PDF to Ghostscript vector formats (EPS, PS, PCL, or XPS)."
-                            + " Input:PDF Output:VECTOR Type:SISO")
+            description = "Converts PDF to Ghostscript vector formats (EPS, PS, PCL, or XPS).")
     public ResponseEntity<Resource> convertPdfToVector(
             @Valid @ModelAttribute PdfVectorExportRequest request) throws Exception {
 
@@ -130,8 +151,7 @@ public class PdfVectorExportController {
             throw e;
         }
 
-        String outputName =
-                GeneralUtils.generateFilename(originalName, "_converted." + outputFormat);
+        String outputName = GeneralUtils.generateFilename(originalName, "." + outputFormat);
 
         MediaType mediaType;
         switch (outputFormat.toLowerCase(Locale.ROOT)) {

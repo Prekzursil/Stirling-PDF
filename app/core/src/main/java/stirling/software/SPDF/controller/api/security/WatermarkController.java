@@ -3,22 +3,16 @@ package stirling.software.SPDF.controller.api.security;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.beans.PropertyEditorSupport;
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.file.Files;
 
 import javax.imageio.ImageIO;
 
-import org.apache.commons.io.IOUtils;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.font.PDFont;
 import org.apache.pdfbox.pdmodel.font.PDType0Font;
-import org.apache.pdfbox.pdmodel.font.PDType1Font;
-import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 import org.apache.pdfbox.pdmodel.graphics.image.LosslessFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.pdmodel.graphics.state.PDExtendedGraphicsState;
@@ -43,7 +37,10 @@ import stirling.software.SPDF.model.api.security.AddWatermarkRequest;
 import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.SecurityApi;
 import stirling.software.common.enumeration.ResourceWeight;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
+import stirling.software.common.util.ExceptionUtils;
 import stirling.software.common.util.GeneralUtils;
 import stirling.software.common.util.PdfUtils;
 import stirling.software.common.util.RegexPatternUtils;
@@ -74,12 +71,13 @@ public class WatermarkController {
             value = "/add-watermark",
             resourceWeight = ResourceWeight.MEDIUM_WEIGHT)
     @StandardPdfResponse
+    @ToolIO(produces = ToolFormat.PDF)
     @Operation(
             summary = "Add watermark to a PDF file",
             description =
                     "This endpoint adds a watermark to a given PDF file. Users can specify the"
-                            + " watermark type (text or image), rotation, opacity, width spacer, and"
-                            + " height spacer. Input:PDF Output:PDF Type:SISO")
+                            + " watermark type (text or image), rotation, opacity, width spacer, and height"
+                            + " spacer.")
     public ResponseEntity<Resource> addWatermark(@Valid @ModelAttribute AddWatermarkRequest request)
             throws IOException, Exception {
         MultipartFile pdfFile = request.getFileInput();
@@ -87,9 +85,21 @@ public class WatermarkController {
         if (pdfFileName != null && (pdfFileName.contains("..") || pdfFileName.startsWith("/"))) {
             throw new SecurityException("Invalid file path in pdfFile");
         }
-        String watermarkType = request.getWatermarkType();
         String watermarkText = request.getWatermarkText();
         MultipartFile watermarkImage = request.getWatermarkImage();
+        String watermarkType = resolveWatermarkType(request.getWatermarkType(), watermarkImage);
+        if ("text".equalsIgnoreCase(watermarkType)
+                && (watermarkText == null || watermarkText.isBlank())) {
+            throw ExceptionUtils.createIllegalArgumentException(
+                    "error.watermark.text.required",
+                    "watermarkText must be provided when watermarkType is 'text'");
+        }
+        if ("image".equalsIgnoreCase(watermarkType)
+                && (watermarkImage == null || watermarkImage.isEmpty())) {
+            throw ExceptionUtils.createIllegalArgumentException(
+                    "error.watermark.image.required",
+                    "watermarkImage must be provided when watermarkType is 'image'");
+        }
         if (watermarkImage != null) {
             String watermarkImageFileName = watermarkImage.getOriginalFilename();
             if (watermarkImageFileName != null
@@ -109,6 +119,11 @@ public class WatermarkController {
 
         // Load the input PDF with proper resource management
         try (PDDocument document = pdfDocumentFactory.load(pdfFile)) {
+
+            PDFont font =
+                    "text".equalsIgnoreCase(watermarkType)
+                            ? loadWatermarkFont(document, alphabet)
+                            : null;
 
             // Create a page in the document
             for (PDPage page : document.getPages()) {
@@ -130,13 +145,12 @@ public class WatermarkController {
                         addTextWatermark(
                                 contentStream,
                                 watermarkText,
-                                document,
                                 page,
                                 rotation,
                                 widthSpacer,
                                 heightSpacer,
                                 fontSize,
-                                alphabet,
+                                font,
                                 customColor);
                     } else if ("image".equalsIgnoreCase(watermarkType)) {
                         addImageWatermark(
@@ -157,36 +171,39 @@ public class WatermarkController {
                     // Return the watermarked PDF as a response
                     return WebResponseUtils.pdfDocToWebResponse(
                             convertedPdf,
-                            GeneralUtils.generateFilename(
-                                    pdfFile.getOriginalFilename(), "_watermarked.pdf"),
+                            GeneralUtils.generateFilename(pdfFile.getOriginalFilename(), ".pdf"),
                             tempFileManager);
                 }
             } else {
                 // Return the watermarked PDF as a response
                 return WebResponseUtils.pdfDocToWebResponse(
                         document,
-                        GeneralUtils.generateFilename(
-                                pdfFile.getOriginalFilename(), "_watermarked.pdf"),
+                        GeneralUtils.generateFilename(pdfFile.getOriginalFilename(), ".pdf"),
                         tempFileManager);
             }
         }
     }
 
-    private void addTextWatermark(
-            PDPageContentStream contentStream,
-            String watermarkText,
-            PDDocument document,
-            PDPage page,
-            float rotation,
-            int widthSpacer,
-            int heightSpacer,
-            float fontSize,
-            String alphabet,
-            String colorString)
-            throws IOException {
-        String resourceDir = "";
-        PDFont font = new PDType1Font(Standard14Fonts.FontName.HELVETICA);
-        resourceDir =
+    private static String resolveWatermarkType(String watermarkType, MultipartFile image) {
+        if (watermarkType == null || watermarkType.isBlank()) {
+            return image != null && !image.isEmpty() ? "image" : "text";
+        }
+        if (!"text".equalsIgnoreCase(watermarkType) && !"image".equalsIgnoreCase(watermarkType)) {
+            throw ExceptionUtils.createIllegalArgumentException(
+                    "error.watermark.type.invalid",
+                    "Invalid watermarkType ''{0}'': must be ''text'' or ''image''",
+                    watermarkType);
+        }
+        return watermarkType;
+    }
+
+    /**
+     * Load the watermark font once for the whole document. {@link PDType0Font#load} embeds a font
+     * object into {@code document} on every call, so calling this per page holds one full copy of
+     * the TTF per page in memory (10 MB each for the CJK faces).
+     */
+    private PDFont loadWatermarkFont(PDDocument document, String alphabet) throws IOException {
+        String resourceDir =
                 switch (alphabet) {
                     case "arabic" -> "static/fonts/NotoSansArabic-Regular.ttf";
                     case "japanese" -> "static/fonts/NotoSansJP-Regular.ttf";
@@ -196,17 +213,22 @@ public class WatermarkController {
                     default -> "static/fonts/NotoSans-Regular.ttf";
                 };
 
-        ClassPathResource classPathResource = new ClassPathResource(resourceDir);
-        String fileExtension = resourceDir.substring(resourceDir.lastIndexOf('.'));
-        File tempFile = Files.createTempFile("NotoSansFont", fileExtension).toFile();
-        try (InputStream is = classPathResource.getInputStream();
-                FileOutputStream os = new FileOutputStream(tempFile)) {
-            IOUtils.copy(is, os);
-            font = PDType0Font.load(document, tempFile);
-        } finally {
-            Files.deleteIfExists(tempFile.toPath());
+        try (InputStream is = new ClassPathResource(resourceDir).getInputStream()) {
+            return PDType0Font.load(document, is);
         }
+    }
 
+    private void addTextWatermark(
+            PDPageContentStream contentStream,
+            String watermarkText,
+            PDPage page,
+            float rotation,
+            int widthSpacer,
+            int heightSpacer,
+            float fontSize,
+            PDFont font,
+            String colorString)
+            throws IOException {
         contentStream.setFont(font, fontSize);
 
         Color redactColor;
@@ -284,6 +306,12 @@ public class WatermarkController {
 
         // Load the watermark image
         BufferedImage image = ImageIO.read(watermarkImage.getInputStream());
+        if (image == null) {
+            throw ExceptionUtils.createIllegalArgumentException(
+                    ExceptionUtils.ErrorCode.INVALID_ARGUMENT,
+                    "watermarkImage",
+                    "must be a supported image");
+        }
 
         // Compute width based on original aspect ratio
         float aspectRatio = (float) image.getWidth() / (float) image.getHeight();

@@ -45,6 +45,8 @@ import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.SecurityApi;
 import stirling.software.common.enumeration.ResourceWeight;
 import stirling.software.common.model.ApplicationProperties;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.GeneralUtils;
 import stirling.software.common.util.TempFile;
@@ -84,13 +86,17 @@ public class TimestampController {
             value = "/timestamp-pdf",
             resourceWeight = ResourceWeight.MEDIUM_WEIGHT)
     @StandardPdfResponse
+    @ToolIO(produces = ToolFormat.PDF)
     @Operation(
-            summary = "Add RFC 3161 document timestamp to a PDF",
+            summary =
+                    "Add an RFC 3161 document timestamp to a PDF. Run last: any later edit"
+                            + " invalidates it",
             description =
                     "Contacts a trusted Time Stamp Authority (TSA) server and embeds an RFC 3161"
-                            + " document timestamp into the PDF. Only a SHA-256 hash of the"
-                            + " document is sent to the TSA — the PDF itself never leaves the"
-                            + " server. Input:PDF Output:PDF Type:SISO")
+                            + " document timestamp into the PDF. Only a SHA-256 hash of the document is sent"
+                            + " to the TSA - the PDF itself never leaves the server. Make the"
+                            + " timestamp the last change to the file: any later edit invalidates"
+                            + " it.")
     public ResponseEntity<Resource> timestampPdf(@ModelAttribute TimestampPdfRequest request)
             throws Exception {
         MultipartFile inputFile = request.getFileInput();
@@ -151,7 +157,7 @@ public class TimestampController {
 
         return WebResponseUtils.pdfFileToWebResponse(
                 tempOutputFile,
-                GeneralUtils.generateFilename(inputFile.getOriginalFilename(), "_timestamped.pdf"));
+                GeneralUtils.generateFilename(inputFile.getOriginalFilename(), ".pdf"));
     }
 
     private byte[] requestTimestampToken(InputStream content, String tsaUrl) throws IOException {

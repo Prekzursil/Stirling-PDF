@@ -25,15 +25,20 @@ import stirling.software.SPDF.config.EndpointConfiguration;
 import stirling.software.SPDF.model.api.converters.ConvertPdfToEpubRequest;
 import stirling.software.SPDF.model.api.converters.ConvertPdfToEpubRequest.OutputFormat;
 import stirling.software.SPDF.model.api.converters.ConvertPdfToEpubRequest.TargetDevice;
+import stirling.software.SPDF.service.OfficeConversionService;
 import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.ConvertApi;
+import stirling.software.common.configuration.RuntimePathConfig;
 import stirling.software.common.enumeration.ResourceWeight;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.util.GeneralUtils;
 import stirling.software.common.util.ProcessExecutor;
 import stirling.software.common.util.ProcessExecutor.ProcessExecutorResult;
 import stirling.software.common.util.TempFile;
 import stirling.software.common.util.TempFileManager;
 import stirling.software.common.util.WebResponseUtils;
+import stirling.software.officeconvert.EbookOptions;
 
 @ConvertApi
 @RequiredArgsConstructor
@@ -49,19 +54,24 @@ public class ConvertPDFToEpubController {
 
     private final TempFileManager tempFileManager;
     private final EndpointConfiguration endpointConfiguration;
+    private final RuntimePathConfig runtimePathConfig;
+    private final OfficeConversionService officeConversionService;
 
-    private static List<String> buildCalibreCommand(
+    private List<String> buildCalibreCommand(
             Path inputPath, Path outputPath, boolean detectChapters, TargetDevice targetDevice) {
         List<String> command = new ArrayList<>();
-        command.add("ebook-convert");
+        command.add(runtimePathConfig.getCalibrePath());
         command.add(inputPath.toString());
         command.add(outputPath.toString());
 
-        // Use pdftohtml engine (poppler) for PDF input instead of calibre's Qt-based engine.
-        // This avoids the Qt WebEngine dependency for PDF parsing and uses the lighter
-        // poppler-utils pdftohtml binary which is already available in the container.
+        // Calibre's own engine reads pdftohtml's XML output, so no Qt WebEngine is involved in
+        // parsing. Header and footer detection is off: it fails on some short documents.
         command.add("--pdf-engine");
-        command.add("pdftohtml");
+        command.add("calibre");
+        command.add("--pdf-header-skip");
+        command.add("0");
+        command.add("--pdf-footer-skip");
+        command.add("0");
 
         // Golden defaults
         command.add("--enable-heuristics");
@@ -86,15 +96,17 @@ public class ConvertPDFToEpubController {
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             value = "/pdf/epub",
             resourceWeight = ResourceWeight.LARGE_WEIGHT)
+    @ToolIO(produces = ToolFormat.EBOOK)
     @Operation(
             summary = "Convert PDF to EPUB/AZW3",
             description =
-                    "Convert a PDF file to a high-quality EPUB or AZW3 ebook using Calibre. Input:PDF"
-                            + " Output:EPUB/AZW3 Type:SISO")
+                    "Convert a PDF file to an EPUB or AZW3 ebook using Calibre or Stirling Office Convert.")
     public ResponseEntity<Resource> convertPdfToEpub(
             @ModelAttribute ConvertPdfToEpubRequest request) throws Exception {
 
-        if (!endpointConfiguration.isGroupEnabled(CALIBRE_GROUP)) {
+        boolean officeConvert =
+                officeConversionService.replacesLibreOffice(request.getUseStirlingOfficeConvert());
+        if (!officeConvert && !endpointConfiguration.isGroupEnabled(CALIBRE_GROUP)) {
             throw new IllegalStateException(
                     "Calibre support is disabled. Enable the Calibre group or install Calibre to use"
                             + " this feature.");
@@ -127,6 +139,21 @@ public class ConvertPDFToEpubController {
             throw new IllegalArgumentException("Input file must be a PDF");
         }
 
+        if (officeConvert) {
+            EbookOptions ebook =
+                    EbookOptions.defaults()
+                            .chapters(detectChapters)
+                            .device(
+                                    targetDevice == TargetDevice.KINDLE_EINK_TEXT
+                                            ? EbookOptions.Device.KINDLE
+                                            : EbookOptions.Device.TABLET);
+            return officeConversionService.convert(
+                    inputFile,
+                    outputFormat.getExtension(),
+                    MediaType.valueOf(outputFormat.getMediaType()),
+                    officeConversionService.settings().ebook(ebook));
+        }
+
         String baseName = FilenameUtils.getBaseName(originalFilename);
         if (baseName == null || baseName.isBlank()) {
             baseName = "document";
@@ -156,11 +183,7 @@ public class ConvertPDFToEpubController {
             }
 
             if (result.getRc() != 0) {
-                String errorMessage = result.getMessages();
-                if (errorMessage == null || errorMessage.isBlank()) {
-                    errorMessage = "Calibre conversion failed";
-                }
-                throw new IllegalStateException(errorMessage);
+                throw new IllegalStateException("Calibre conversion failed");
             }
 
             if (!Files.exists(outputPath) || Files.size(outputPath) == 0L) {
@@ -170,11 +193,7 @@ public class ConvertPDFToEpubController {
 
             String outputFilename =
                     GeneralUtils.generateFilename(
-                            originalFilename,
-                            "_convertedTo"
-                                    + outputFormat.name()
-                                    + "."
-                                    + outputFormat.getExtension());
+                            originalFilename, "." + outputFormat.getExtension());
 
             MediaType mediaType = MediaType.valueOf(outputFormat.getMediaType());
             TempFile tempOut =

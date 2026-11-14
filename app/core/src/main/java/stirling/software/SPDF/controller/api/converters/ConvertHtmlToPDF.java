@@ -14,11 +14,15 @@ import io.swagger.v3.oas.annotations.Operation;
 import lombok.RequiredArgsConstructor;
 
 import stirling.software.SPDF.config.swagger.StandardPdfResponse;
+import stirling.software.SPDF.service.OfficeConversionService;
+import stirling.software.SPDF.service.OfficeToPdfService;
 import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.ConvertApi;
 import stirling.software.common.configuration.RuntimePathConfig;
 import stirling.software.common.enumeration.ResourceWeight;
 import stirling.software.common.model.api.converters.HTMLToPdfRequest;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.*;
 
@@ -31,19 +35,26 @@ public class ConvertHtmlToPDF {
     private final RuntimePathConfig runtimePathConfig;
 
     private final TempFileManager tempFileManager;
+    private final OfficeConversionService officeConversionService;
+    private final OfficeToPdfService officeToPdfService;
 
     private final CustomHtmlSanitizer customHtmlSanitizer;
 
+    /** Zoom applies to the standard converter; Office Convert ignores it. */
     @AutoJobPostMapping(
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             value = "/html/pdf",
             resourceWeight = ResourceWeight.LARGE_WEIGHT)
     @StandardPdfResponse
+    // A ZIP of HTML plus its CSS is a first-class input here, and is what convert/pdf/html emits.
+    @ToolIO(
+            accepts = {ToolFormat.HTML, ToolFormat.ZIP},
+            inputExtensions = {"html", "zip"},
+            produces = ToolFormat.PDF)
     @Operation(
             summary = "Convert an HTML or ZIP (containing HTML and CSS) to PDF",
             description =
-                    "This endpoint takes an HTML or ZIP file input and converts it to a PDF format."
-                            + " Input:HTML Output:PDF Type:SISO")
+                    "This endpoint takes an HTML or ZIP file input and converts it to a PDF format.")
     public ResponseEntity<Resource> HtmlToPdf(@ModelAttribute HTMLToPdfRequest request)
             throws Exception {
         MultipartFile fileInput = request.getFileInput();
@@ -59,14 +70,19 @@ public class ConvertHtmlToPDF {
                     "error.fileFormatRequired", "File must be in {0} format", ".html or .zip");
         }
 
+        boolean officeConvert =
+                officeConversionService.replacesLibreOffice(request.getUseStirlingOfficeConvert());
         byte[] pdfBytes =
-                FileToPdf.convertHtmlToPdf(
-                        runtimePathConfig.getWeasyPrintPath(),
-                        request,
-                        fileInput.getBytes(),
-                        originalFilename,
-                        tempFileManager,
-                        customHtmlSanitizer);
+                officeConvert
+                        ? officeToPdfService.convertHtml(
+                                fileInput.getBytes(), originalFilename.endsWith(".zip"))
+                        : FileToPdf.convertHtmlToPdf(
+                                runtimePathConfig.getWeasyPrintPath(),
+                                request,
+                                fileInput.getBytes(),
+                                originalFilename,
+                                tempFileManager,
+                                customHtmlSanitizer);
 
         pdfBytes = pdfDocumentFactory.createNewBytesBasedOnOldDocument(pdfBytes);
 

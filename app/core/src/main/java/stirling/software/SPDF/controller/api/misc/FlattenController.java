@@ -29,9 +29,12 @@ import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.MiscApi;
 import stirling.software.common.enumeration.ResourceWeight;
 import stirling.software.common.model.ApplicationProperties;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.ApplicationContextProvider;
 import stirling.software.common.util.ExceptionUtils;
+import stirling.software.common.util.LimitedPDFRenderer;
 import stirling.software.common.util.TempFileManager;
 import stirling.software.common.util.WebResponseUtils;
 
@@ -39,6 +42,9 @@ import stirling.software.common.util.WebResponseUtils;
 @Slf4j
 @RequiredArgsConstructor
 public class FlattenController {
+
+    // Default when the caller sends no renderDpi; an explicit request still wins up to maxDPI
+    private static final int FLATTEN_RENDER_DPI = 300;
 
     private final CustomPDFDocumentFactory pdfDocumentFactory;
     private final TempFileManager tempFileManager;
@@ -48,11 +54,13 @@ public class FlattenController {
             value = "/flatten",
             resourceWeight = ResourceWeight.SMALL_WEIGHT)
     @StandardPdfResponse
+    @ToolIO(produces = ToolFormat.PDF)
     @Operation(
-            summary = "Flatten PDF form fields or full page",
+            summary = "Flatten a PDF to images, or flatten only its form fields",
             description =
-                    "Flattening just PDF form fields or converting each page to images to make text"
-                            + " unselectable. Input:PDF, Output:PDF. Type:SISO")
+                    "By default every page becomes an image, so text can no longer be"
+                            + " selected. flattenOnlyForms=true only merges form fields into the"
+                            + " page.")
     public ResponseEntity<Resource> flatten(@ModelAttribute FlattenRequest request)
             throws Exception {
         MultipartFile file = request.getFileInput();
@@ -72,14 +80,13 @@ public class FlattenController {
             } else {
                 // flatten whole page aka convert each page to image and re-add it (making text
                 // unselectable)
-                PDFRenderer pdfRenderer = new PDFRenderer(document);
+                PDFRenderer pdfRenderer = new LimitedPDFRenderer(document);
                 pdfRenderer.setSubsamplingAllowed(
                         true); // Enable subsampling to reduce memory usage
 
                 try (PDDocument newDocument =
                         pdfDocumentFactory.createNewDocumentBasedOnOldDocument(document)) {
 
-                    int defaultRenderDpi = 100; // Default fallback
                     ApplicationProperties properties =
                             ApplicationContextProvider.getBean(ApplicationProperties.class);
                     Integer configuredMaxDpi = null;
@@ -90,10 +97,11 @@ public class FlattenController {
                     int maxDpi =
                             (configuredMaxDpi != null && configuredMaxDpi > 0)
                                     ? configuredMaxDpi
-                                    : defaultRenderDpi;
+                                    : FLATTEN_RENDER_DPI;
 
                     Integer requestedDpi = request.getRenderDpi();
-                    int renderDpiTemp = maxDpi;
+                    // maxDpi is a ceiling; without an explicit request use the print-quality target
+                    int renderDpiTemp = Math.min(FLATTEN_RENDER_DPI, maxDpi);
                     if (requestedDpi != null) {
                         renderDpiTemp = Math.min(requestedDpi, maxDpi);
                         renderDpiTemp = Math.max(renderDpiTemp, 72);
@@ -105,10 +113,6 @@ public class FlattenController {
                         final int pageIndex = i;
                         BufferedImage image = null;
                         try {
-                            // Validate dimensions BEFORE rendering to prevent OOM
-                            ExceptionUtils.validateRenderingDimensions(
-                                    document.getPage(pageIndex), pageIndex + 1, renderDpi);
-
                             // Wrap entire rendering operation to catch OutOfMemoryError from any
                             // depth
                             image =

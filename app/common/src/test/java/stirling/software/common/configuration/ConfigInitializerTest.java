@@ -22,7 +22,6 @@ class ConfigInitializerTest {
             """
             premium:
               proFeatures:
-                ssoAutoLogin: false
                 customMetadata:
                   autoUpdateMetadata: false
                   author: username
@@ -49,8 +48,6 @@ class ConfigInitializerTest {
 
         new ConfigInitializer().migrateProFeaturesKeyCasing(existing, template);
 
-        assertEquals(
-                "true", template.getValueByExactKeyPath("premium", "proFeatures", "ssoAutoLogin"));
         assertEquals(
                 "true",
                 template.getValueByExactKeyPath(
@@ -86,10 +83,50 @@ class ConfigInitializerTest {
         new ConfigInitializer().migrateProFeaturesKeyCasing(existing, template);
 
         assertEquals(
-                "false", template.getValueByExactKeyPath("premium", "proFeatures", "ssoAutoLogin"));
-        assertEquals(
                 "username",
                 template.getValueByExactKeyPath(
                         "premium", "proFeatures", "customMetadata", "author"));
+    }
+
+    private static final String SETUP_TEMPLATE =
+            """
+            system:
+              setupCompleted: false
+              defaultLocale: ""
+            """;
+
+    @Test
+    void markExistingServerSetUp_upgradedSettingsMergeAsSetUp() {
+        YamlHelper template = new YamlHelper(LOAD_SETTINGS, SETUP_TEMPLATE);
+        YamlHelper existing =
+                new YamlHelper(
+                        LOAD_SETTINGS,
+                        """
+                        system:
+                          defaultLocale: de-DE
+                        """);
+
+        assertTrue(new ConfigInitializer().markExistingServerSetUp(existing, template));
+        template.updateValuesFromYaml(existing, template);
+
+        assertEquals("true", template.getValueByExactKeyPath("system", "setupCompleted"));
+        assertEquals("de-DE", template.getValueByExactKeyPath("system", "defaultLocale"));
+    }
+
+    @Test
+    void markExistingServerSetUp_keepsAnUnfinishedSetup() {
+        YamlHelper template = new YamlHelper(LOAD_SETTINGS, SETUP_TEMPLATE);
+        YamlHelper existing =
+                new YamlHelper(
+                        LOAD_SETTINGS,
+                        """
+                        system:
+                          setupCompleted: false
+                        """);
+
+        assertFalse(new ConfigInitializer().markExistingServerSetUp(existing, template));
+        template.updateValuesFromYaml(existing, template);
+
+        assertEquals("false", template.getValueByExactKeyPath("system", "setupCompleted"));
     }
 }

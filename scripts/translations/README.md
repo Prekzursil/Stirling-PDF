@@ -4,7 +4,7 @@ This directory contains Python scripts for managing frontend translations in Sti
 
 ## Current Format: TOML
 
-**Stirling PDF uses TOML format for translations** in `frontend/editor/public/locales/{lang}/translation.toml`.
+**Stirling PDF uses TOML format for translations** in `frontend/public/locales/{lang}/translation.toml`.
 
 **All scripts now support TOML format!**
 
@@ -29,7 +29,7 @@ python3 scripts/translations/auto_translate.py es-ES --no-cleanup
 **What it does:**
 1. Extracts untranslated entries from the language file
 2. Splits into batches (default 500 entries each)
-3. Translates each batch using GPT-5 with specialized prompts
+3. Translates each batch using GPT-5.6 with specialized prompts
 4. Validates placeholders are preserved
 5. Merges translated batches
 6. Applies translations to language file
@@ -39,7 +39,7 @@ python3 scripts/translations/auto_translate.py es-ES --no-cleanup
 
 **Time:** ~8-10 minutes per language with 1200+ untranslated entries
 
-**Cost:** ~$2-4 per language using GPT-5 (or use `gpt-5-mini` for lower cost)
+**Cost:** ~$8-15 per language using GPT-5.5 (or use `gpt-5.6-luna` for ~$2-4 if your org has 5.6 access)
 
 See [`auto_translate.py`](#auto_translatepy-automated-translation-pipeline) for full details.
 
@@ -190,7 +190,7 @@ python scripts/translations/translation_merger.py fr-FR create-template --output
 python scripts/translations/translation_merger.py fr-FR apply-translations --translations-file fr_translated.json
 
 # Override default paths if needed
-python scripts/translations/translation_merger.py fr-FR add-missing --locales-dir ./frontend/editor/public/locales --ignore-file ./scripts/ignore_translation.toml
+python scripts/translations/translation_merger.py fr-FR add-missing --locales-dir ./frontend/public/locales --ignore-file ./scripts/ignore_translation.toml
 
 # Remove unused translations not present in en-US
 python scripts/translations/translation_merger.py fr-FR remove-unused
@@ -248,7 +248,7 @@ python scripts/translations/compact_translator.py it-IT --output to_translate.js
 
 ### 5. `auto_translate.py` - Automated Translation Pipeline
 
-**NEW: Fully automated translation workflow using GPT-5.**
+**NEW: Fully automated translation workflow using GPT-5.6.**
 
 Combines all translation steps into a single command that handles everything from extraction to verification.
 
@@ -276,7 +276,7 @@ python3 scripts/translations/auto_translate.py es-ES --skip-verification
 
 **Features:**
 - Fully automated end-to-end translation pipeline
-- Uses GPT-5 with specialized prompts for Stirling PDF
+- Uses GPT-5.6 with specialized prompts for Stirling PDF
 - Preserves all placeholders ({n}, {{variable}}, etc.)
 - Maintains consistent terminology
 - Validates translations automatically
@@ -286,7 +286,7 @@ python3 scripts/translations/auto_translate.py es-ES --skip-verification
 **Pipeline Steps:**
 1. **Extract**: Finds all untranslated entries
 2. **Split**: Divides into manageable batches (default: 500 entries)
-3. **Translate**: Uses GPT-5 to translate each batch with specialized prompts
+3. **Translate**: Uses GPT-5.6 to translate each batch with specialized prompts
 4. **Validate**: Ensures placeholders are preserved
 5. **Merge**: Combines all translated batches
 6. **Apply**: Updates the language file
@@ -302,9 +302,31 @@ python3 scripts/translations/auto_translate.py es-ES --skip-verification
 - Uses appropriate formal/informal tone per language
 
 **Supported Languages:**
-All language codes from `frontend/editor/public/locales/` (e.g., es-ES, de-DE, fr-FR, zh-CN, ar-AR, etc.)
+All language codes from `frontend/public/locales/` (e.g., es-ES, de-DE, fr-FR, zh-CN, ar-AR, etc.)
 
-### 6. `batch_translator.py` - GPT-5 Translation Engine
+#### Retranslating changed English text
+
+`auto_translate.py` only picks up keys that are missing. When an existing en-US string is reworded, other languages keep the old translation. `bulk_auto_translate.py --mode changed` finds those keys from git history and retranslates them:
+
+```bash
+# See how many changed keys each language has (no API calls)
+python3 scripts/translations/bulk_auto_translate.py --mode changed --dry-run
+
+# Retranslate changed keys only, or missing + changed together
+python3 scripts/translations/bulk_auto_translate.py --mode changed --parallel 5
+python3 scripts/translations/bulk_auto_translate.py --mode all --parallel 5
+
+# Inspect old vs new English per key without translating
+python3 scripts/translations/stale_translations.py --languages de-DE --verbose
+```
+
+For each key, `stale_translations.py` finds the commit where the translation last changed and compares the English text at that commit with today's en-US. It follows the old file locations (`frontend/public/locales`, `translation.json`).
+
+en-GB was the source language until en-US was re-added in June 2026. Translations written before that are compared against en-GB, then mapped to the en-US text of the same string, so US/GB spelling differences alone never count as a change. Case-only English edits are skipped too.
+
+Uncommitted edits to a language file count as up to date. `auto_translate.py --keys-file keys.json [--only-keys]` retranslates a specific list of keys.
+
+### 6. `batch_translator.py` - GPT-5.6 Translation Engine
 
 Low-level translation script used by `auto_translate.py`. Can be used standalone for manual batch translation.
 
@@ -316,25 +338,27 @@ python3 scripts/translations/batch_translator.py my_batch.json --language es-ES 
 # Translate multiple batches
 python3 scripts/translations/batch_translator.py batch_*.json --language de-DE --api-key YOUR_KEY
 
-# Use different GPT model
-python3 scripts/translations/batch_translator.py batch.json --language fr-FR --model gpt-5-mini
+# Use a cheaper model
+python3 scripts/translations/batch_translator.py batch.json --language fr-FR --model gpt-5.6-luna
 
 # Skip validation
 python3 scripts/translations/batch_translator.py batch.json --language it-IT --skip-validation
 ```
 
 **Features:**
-- Translates JSON batch files using OpenAI GPT-5
+- Translates JSON batch files using OpenAI GPT-5.6
 - Specialized system prompts for Stirling PDF translations
 - Automatic placeholder validation
 - Supports pattern matching for multiple files
-- Configurable model selection (gpt-5, gpt-5-mini, gpt-5-nano)
+- Configurable model selection (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna)
+- Per-batch and per-run token + cost reporting
 - Rate limiting with configurable delays
 
 **Models:**
-- `gpt-5` (default): Best quality, $1.25/1M input, $10/1M output
-- `gpt-5-mini`: Balanced quality/cost
-- `gpt-5-nano`: Fastest, most economical
+- `gpt-5.5` (default): Previous flagship, strong translation quality, $5/1M input, $30/1M output
+- `gpt-5.6-sol`: Newest flagship reasoning, $5/1M input, $30/1M output (requires org 5.6 access)
+- `gpt-5.6-terra`: Balanced quality/cost, $2.50/1M input, $15/1M output (requires org 5.6 access)
+- `gpt-5.6-luna`: Fastest/cheapest, $1/1M input, $6/1M output (requires org 5.6 access)
 
 ### 7. `json_beautifier.py`
 Restructures and beautifies translation JSON files to match en-US structure exactly.
@@ -469,7 +493,7 @@ python scripts/translations/translation_merger.py fr-FR apply-translations --tra
 
 ## Translation File Structure
 
-Translation files are located in `frontend/editor/public/locales/{language}/translation.toml` with TOML structure:
+Translation files are located in `frontend/public/locales/{language}/translation.toml` with TOML structure:
 
 ```toml
 [addPageNumbers]
@@ -725,7 +749,7 @@ python scripts/translations/ai_translation_helper.py apply-batch de_batch_1.json
 ## Integration with Development
 
 These scripts integrate with the existing translation system:
-- Works with the current `frontend/editor/public/locales/` structure
+- Works with the current `frontend/public/locales/` structure
 - Compatible with the i18n system used in the React frontend
 - Respects the JSON format expected by the translation loader
 - Maintains the nested structure required by the UI components

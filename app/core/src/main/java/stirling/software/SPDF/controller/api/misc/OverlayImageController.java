@@ -23,6 +23,8 @@ import stirling.software.SPDF.utils.SvgOverlayUtil;
 import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.MiscApi;
 import stirling.software.common.enumeration.ResourceWeight;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.GeneralUtils;
 import stirling.software.common.util.SvgSanitizer;
@@ -43,14 +45,14 @@ public class OverlayImageController {
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             value = "/add-image",
             resourceWeight = ResourceWeight.MEDIUM_WEIGHT)
+    @ToolIO(produces = ToolFormat.PDF)
     @Operation(
-            summary = "Overlay image onto a PDF file",
+            summary = "Overlay an image at x,y on the first or every page",
             description =
-                    "This endpoint overlays an image onto a PDF file at the specified coordinates. "
-                            + "Supports both raster formats (PNG, JPEG, etc.) and vector format (SVG). "
-                            + "SVG files are rendered as vector graphics for crisp output at any resolution. "
-                            + "The image can be overlaid on every page of the PDF if specified. "
-                            + "Input:PDF/IMAGE/SVG Output:PDF Type:SISO")
+                    "Draws a raster or SVG image at native size (1 px = 1 pt), with its"
+                            + " lower-left corner at PDF user-space coordinates (x, y), in points."
+                            + " The page's lower-left coordinates may be nonzero. To set size,"
+                            + " grid position or pages, use add-stamp with stampType=image.")
     public ResponseEntity<Resource> overlayImage(@ModelAttribute OverlayImageRequest request) {
         MultipartFile pdfFile = request.getFileInput();
         MultipartFile imageFile = request.getImageFile();
@@ -105,8 +107,7 @@ public class OverlayImageController {
 
                 return WebResponseUtils.pdfFileToWebResponse(
                         tempOut,
-                        GeneralUtils.generateFilename(
-                                pdfFile.getOriginalFilename(), "_overlayed.pdf"));
+                        GeneralUtils.generateFilename(pdfFile.getOriginalFilename(), ".pdf"));
             }
 
         } catch (IOException e) {

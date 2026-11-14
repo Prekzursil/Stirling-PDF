@@ -2,7 +2,10 @@ package stirling.software.SPDF.controller.api.misc;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSName;
@@ -27,6 +30,8 @@ import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.GeneralApi;
 import stirling.software.common.enumeration.ResourceWeight;
 import stirling.software.common.model.api.PDFFile;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.ExceptionUtils;
 import stirling.software.common.util.GeneralUtils;
@@ -46,11 +51,12 @@ public class RemoveImagesController {
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             value = "/remove-image-pdf",
             resourceWeight = ResourceWeight.MEDIUM_WEIGHT)
+    @ToolIO(produces = ToolFormat.PDF)
     @Operation(
             summary = "Remove images from PDF",
             description =
                     "This endpoint removes all embedded images from a PDF file and returns the"
-                            + " modified document. Input:PDF Output:PDF Type:SISO")
+                            + " modified document.")
     public ResponseEntity<Resource> removeImages(@ModelAttribute PDFFile request)
             throws IOException {
 
@@ -60,10 +66,12 @@ public class RemoveImagesController {
 
             int totalPages = pdfDoc.getNumberOfPages();
             int imagesRemoved = 0;
+            // Resources are shared between pages and forms; process each dictionary once
+            Set<COSDictionary> visited = Collections.newSetFromMap(new IdentityHashMap<>());
 
             for (int pageIndex = 0; pageIndex < totalPages; pageIndex++) {
                 PDPage currentPage = pdfDoc.getPage(pageIndex);
-                imagesRemoved += removeImagesFromPage(currentPage);
+                imagesRemoved += removeImagesFromResources(currentPage.getResources(), visited);
             }
 
             log.info("Removed {} images from PDF with {} pages", imagesRemoved, totalPages);
@@ -78,37 +86,16 @@ public class RemoveImagesController {
 
             return WebResponseUtils.pdfFileToWebResponse(
                     tempOut,
-                    GeneralUtils.generateFilename(
-                            inputFile.getOriginalFilename(), "_images_removed.pdf"));
+                    GeneralUtils.generateFilename(inputFile.getOriginalFilename(), ".pdf"));
 
         } catch (IOException e) {
             throw ExceptionUtils.handlePdfException(e, "during image removal");
         }
     }
 
-    private int removeImagesFromPage(PDPage page) throws IOException {
-        int imagesRemoved = 0;
-
-        PDResources resources = page.getResources();
-        if (resources == null) {
-            return imagesRemoved;
-        }
-
-        imagesRemoved += removeImagesFromResources(resources);
-        return imagesRemoved;
-    }
-
-    private int removeImagesFromFormXObject(PDFormXObject formXObject) throws IOException {
-        PDResources resources = formXObject.getResources();
-        if (resources == null) {
-            return 0;
-        }
-
-        return removeImagesFromResources(resources);
-    }
-
-    private int removeImagesFromResources(PDResources resources) throws IOException {
-        if (resources == null) {
+    private int removeImagesFromResources(PDResources resources, Set<COSDictionary> visited)
+            throws IOException {
+        if (resources == null || !visited.add(resources.getCOSObject())) {
             return 0;
         }
 
@@ -136,7 +123,7 @@ public class RemoveImagesController {
                 }
                 // Recursively process nested form XObjects
                 else if (xObject instanceof PDFormXObject form) {
-                    imagesRemoved += removeImagesFromResources(form.getResources());
+                    imagesRemoved += removeImagesFromResources(form.getResources(), visited);
                 }
             } catch (IOException e) {
                 log.warn("Error processing XObject {}: {}", name.getName(), e.getMessage());

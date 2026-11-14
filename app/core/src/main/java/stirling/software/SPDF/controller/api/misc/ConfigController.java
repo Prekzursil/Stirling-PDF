@@ -195,6 +195,9 @@ public class ConfigController {
                     "enableMobileScanner",
                     applicationProperties.getSystem().isEnableMobileScanner());
             configData.put(
+                    "enableMobileSignature",
+                    applicationProperties.getSystem().isEnableMobileSignature());
+            configData.put(
                     "mobileScannerConvertToPdf",
                     applicationProperties.getSystem().getMobileScannerSettings().isConvertToPdf());
             configData.put(
@@ -213,10 +216,14 @@ public class ConfigController {
             // Extract values from ApplicationProperties
             configData.put("appNameNavbar", applicationProperties.getUi().getAppNameNavbar());
             configData.put("languages", applicationProperties.getUi().getLanguages());
-            configData.put("logoStyle", applicationProperties.getUi().getLogoStyle());
             configData.put("defaultLocale", applicationProperties.getSystem().getDefaultLocale());
 
             // User preference defaults
+            configData.put(
+                    "defaultToolPanelMode",
+                    applicationProperties.getUi().getDefaultToolPanelMode());
+            configData.put(
+                    "defaultStartupView", applicationProperties.getUi().getDefaultStartupView());
             configData.put(
                     "defaultHideUnavailableTools",
                     applicationProperties.getUi().isDefaultHideUnavailableTools());
@@ -249,6 +256,18 @@ public class ConfigController {
             boolean enableLogin =
                     applicationProperties.getSecurity().isEnableLogin() && userService != null;
             configData.put("enableLogin", enableLogin);
+
+            configData.put(
+                    "googleDriveAccountConnections",
+                    enableLogin && googleDrive.accountConnectionsReady());
+            ApplicationProperties.Premium.ProFeatures.Microsoft microsoft =
+                    applicationProperties.getPremium().getProFeatures().getMicrosoft();
+            configData.put(
+                    "microsoftAccountConnections",
+                    enableLogin && microsoft.accountConnectionsReady());
+            configData.put(
+                    "honorOwnerPasswords",
+                    applicationProperties.getSecurity().isHonorOwnerPasswords());
             configData.put(
                     "showSettingsWhenNoLogin",
                     applicationProperties.getSystem().isShowSettingsWhenNoLogin());
@@ -302,6 +321,7 @@ public class ConfigController {
 
             // Check if this is a new server (version was 0.0.0 before initialization)
             configData.put("isNewServer", InitialSetup.isNewServer());
+            configData.put("setupCompleted", applicationProperties.getSystem().isSetupCompleted());
 
             // Check if the current user is a first-time user
             boolean isNewUser =
@@ -320,6 +340,9 @@ public class ConfigController {
             configData.put(
                     "enableAlphaFunctionality",
                     applicationProperties.getSystem().isEnableAlphaFunctionality());
+            configData.put(
+                    "stirlingOfficeConversion",
+                    applicationProperties.getSystem().isStirlingOfficeConversion());
             boolean shouldShowUpdate =
                     applicationProperties.getSystem().isShowUpdate()
                             && (showAdmin == null || showAdmin.getShowUpdateOnlyAdmins());
@@ -331,12 +354,40 @@ public class ConfigController {
             configData.put(
                     "enableDesktopInstallSlide",
                     applicationProperties.getSystem().getEnableDesktopInstallSlide());
+            configData.put(
+                    "enableEasterEggs", applicationProperties.getSystem().isEnableEasterEggs());
+            configData.put("enableFeedback", applicationProperties.getSystem().isEnableFeedback());
 
             // Premium/Enterprise settings
-            configData.put("premiumEnabled", applicationProperties.getPremium().isEnabled());
+            configData.put("premiumEnabled", Boolean.TRUE.equals(isRunningProOrHigher()));
+
+            // Whether this instance can link a Stirling (SaaS) account at all. The account-link
+            // beans live in :proprietary and are @ConditionalOnProperty on this same key, so when
+            // it is off they are absent and /api/v1/account-link/* returns 404. The frontend cannot
+            // tell that 404 apart from "not linked yet", so it needs this told to it explicitly
+            // before it can prompt anyone to link. Read from the environment rather than
+            // AccountLinkProperties because :core must not depend on :proprietary.
+            configData.put(
+                    "accountLinkAvailable",
+                    applicationContext
+                            .getEnvironment()
+                            .getProperty(
+                                    "stirling.billing.account-link.enabled", Boolean.class, false));
 
             // AI Engine settings
-            configData.put("aiEngineEnabled", applicationProperties.getAiEngine().isEnabled());
+            ApplicationProperties.AiEngine aiEngineConfig = applicationProperties.getAiEngine();
+            configData.put("aiEngineEnabled", aiEngineConfig.isEnabled());
+            // Per-capability flags let the UI hide individual AI tools an admin has turned off.
+            ApplicationProperties.AiEngine.Features aiFeatures = aiEngineConfig.getFeatures();
+            configData.put(
+                    "aiFeatures",
+                    Map.ofEntries(
+                            Map.entry("chat", aiFeatures.isChat()),
+                            Map.entry("documentQuestions", aiFeatures.isDocumentQuestions()),
+                            Map.entry("createPdf", aiFeatures.isCreatePdf()),
+                            Map.entry("mathAuditor", aiFeatures.isMathAuditor()),
+                            Map.entry("pdfComment", aiFeatures.isPdfComment()),
+                            Map.entry("classify", aiFeatures.isClassify())));
 
             // Timestamp TSA settings — single source of truth for presets + admin URLs
             ApplicationProperties.Security.Timestamp tsConfig =

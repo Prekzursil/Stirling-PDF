@@ -3,6 +3,7 @@ package stirling.software.proprietary.security.filter;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -29,6 +30,8 @@ import org.springframework.security.core.session.SessionInformation;
 import stirling.software.common.model.ApplicationProperties;
 import stirling.software.proprietary.security.model.ApiKeyAuthenticationToken;
 import stirling.software.proprietary.security.model.User;
+import stirling.software.proprietary.security.service.ApiKeyAuthenticationService;
+import stirling.software.proprietary.security.service.ApiKeyAuthenticationService.ApiKeyAuthentication;
 import stirling.software.proprietary.security.service.UserService;
 import stirling.software.proprietary.security.session.SessionPersistentRegistry;
 
@@ -37,6 +40,7 @@ import stirling.software.proprietary.security.session.SessionPersistentRegistry;
 class UserAuthenticationFilterTest {
 
     @Mock private UserService userService;
+    @Mock private ApiKeyAuthenticationService apiKeyAuthenticationService;
     @Mock private SessionPersistentRegistry sessionPersistentRegistry;
 
     private ApplicationProperties.Security securityProp;
@@ -60,7 +64,11 @@ class UserAuthenticationFilterTest {
 
     private UserAuthenticationFilter filter(boolean loginEnabled) {
         return new UserAuthenticationFilter(
-                securityProp, userService, sessionPersistentRegistry, loginEnabled);
+                securityProp,
+                userService,
+                apiKeyAuthenticationService,
+                sessionPersistentRegistry,
+                loginEnabled);
     }
 
     private static User enabledUser(String username) {
@@ -99,11 +107,12 @@ class UserAuthenticationFilterTest {
             User user = enabledUser("api-user");
             user.addAuthority(
                     new stirling.software.proprietary.security.model.Authority("ROLE_USER", user));
-            when(userService.getUserByApiKey("good-key")).thenReturn(Optional.of(user));
-            when(userService.usernameExistsIgnoreCase("api-user")).thenReturn(true);
-            when(userService.isUserDisabled("api-user")).thenReturn(false);
-            when(sessionPersistentRegistry.getAllSessions(any(), anyBoolean()))
-                    .thenReturn(List.of());
+            when(apiKeyAuthenticationService.authenticate("good-key"))
+                    .thenReturn(
+                            Optional.of(
+                                    new ApiKeyAuthentication(
+                                            user, "Prod (sk_demo0000)", user.getAuthorities())));
+            when(userService.findByUsernameIgnoreCase("api-user")).thenReturn(Optional.of(user));
 
             filter(true).doFilter(request, response, filterChain);
 
@@ -117,7 +126,7 @@ class UserAuthenticationFilterTest {
         void invalidApiKeyRejected() throws Exception {
             request.setRequestURI("/api/v1/some/protected");
             request.addHeader("X-API-KEY", "bad-key");
-            when(userService.getUserByApiKey("bad-key")).thenReturn(Optional.empty());
+            when(apiKeyAuthenticationService.authenticate("bad-key")).thenReturn(Optional.empty());
 
             filter(true).doFilter(request, response, filterChain);
 
@@ -166,15 +175,16 @@ class UserAuthenticationFilterTest {
             request.setRequestURI("/api/v1/some/protected");
             User user = enabledUser("alice");
             setAuthentication(user, "alice");
-            when(userService.usernameExistsIgnoreCase("alice")).thenReturn(true);
-            when(userService.isUserDisabled("alice")).thenReturn(false);
-            when(sessionPersistentRegistry.getAllSessions(any(), anyBoolean()))
-                    .thenReturn(List.of());
+            when(userService.findByUsernameIgnoreCase("alice")).thenReturn(Optional.of(user));
 
             filter(true).doFilter(request, response, filterChain);
 
             assertThat(filterChain.getRequest()).isSameAs(request);
             assertThat(response.getStatus()).isEqualTo(200);
+            // Sessions are only needed to expire a rejected user, so the happy path must not read
+            // them, and one lookup must answer both existence and enablement.
+            verify(sessionPersistentRegistry, never()).getAllSessions(any(), anyBoolean());
+            verify(userService).findByUsernameIgnoreCase("alice");
         }
 
         @Test
@@ -183,8 +193,7 @@ class UserAuthenticationFilterTest {
             request.setRequestURI("/api/v1/some/protected");
             User user = enabledUser("ghost");
             setAuthentication(user, "ghost");
-            when(userService.usernameExistsIgnoreCase("ghost")).thenReturn(false);
-            when(userService.isUserDisabled("ghost")).thenReturn(false);
+            when(userService.findByUsernameIgnoreCase("ghost")).thenReturn(Optional.empty());
             SessionInformation sessionInfo =
                     new SessionInformation(user, "sess-1", new java.util.Date());
             when(sessionPersistentRegistry.getAllSessions(any(), anyBoolean()))
@@ -204,8 +213,8 @@ class UserAuthenticationFilterTest {
             request.setRequestURI("/api/v1/some/protected");
             User user = enabledUser("blocked");
             setAuthentication(user, "blocked");
-            when(userService.usernameExistsIgnoreCase("blocked")).thenReturn(true);
-            when(userService.isUserDisabled("blocked")).thenReturn(true);
+            user.setEnabled(false);
+            when(userService.findByUsernameIgnoreCase("blocked")).thenReturn(Optional.of(user));
             when(sessionPersistentRegistry.getAllSessions(any(), anyBoolean()))
                     .thenReturn(List.of());
 
@@ -214,6 +223,41 @@ class UserAuthenticationFilterTest {
             assertThat(response.getStatus()).isEqualTo(403);
             assertThat(response.getContentAsString()).contains("User account is disabled");
             assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+        }
+
+        @Test
+        @DisplayName("refuses a disabled user's session bootstrap on /auth/me")
+        void disabledUserRefusedOnAuthMe() throws Exception {
+            request.setMethod("GET");
+            request.setRequestURI("/api/v1/auth/me");
+            User user = enabledUser("blocked");
+            setAuthentication(user, "blocked");
+            user.setEnabled(false);
+            when(userService.findByUsernameIgnoreCase("blocked")).thenReturn(Optional.of(user));
+            when(sessionPersistentRegistry.getAllSessions(any(), anyBoolean()))
+                    .thenReturn(List.of());
+
+            filter(true).doFilter(request, response, filterChain);
+
+            assertThat(response.getStatus()).isEqualTo(403);
+            assertThat(filterChain.getRequest()).isNull();
+        }
+
+        @Test
+        @DisplayName("refuses a deleted user's session bootstrap on /auth/me")
+        void deletedUserRefusedOnAuthMe() throws Exception {
+            request.setMethod("GET");
+            request.setRequestURI("/api/v1/auth/me");
+            User user = enabledUser("ghost");
+            setAuthentication(user, "ghost");
+            when(userService.findByUsernameIgnoreCase("ghost")).thenReturn(Optional.empty());
+            when(sessionPersistentRegistry.getAllSessions(any(), anyBoolean()))
+                    .thenReturn(List.of());
+
+            filter(true).doFilter(request, response, filterChain);
+
+            assertThat(response.getStatus()).isEqualTo(401);
+            assertThat(filterChain.getRequest()).isNull();
         }
 
         private void setAuthentication(User principal, String name) {
@@ -247,12 +291,58 @@ class UserAuthenticationFilterTest {
         }
 
         @Test
+        @DisplayName("does not skip /auth/me, so account status is checked there")
+        void doesNotSkipAuthMe() {
+            request.setMethod("GET");
+            request.setRequestURI("/api/v1/auth/me");
+
+            assertThat(filter(true).shouldNotFilter(request)).isFalse();
+        }
+
+        @Test
         @DisplayName("does not skip an arbitrary protected API endpoint")
         void doesNotSkipProtectedEndpoint() {
             request.setMethod("POST");
             request.setRequestURI("/api/v1/user/admin/saveUser");
 
             assertThat(filter(true).shouldNotFilter(request)).isFalse();
+        }
+
+        @Test
+        @DisplayName("does not skip a percent-encoded API path on GET")
+        void doesNotSkipEncodedApiPathOnGet() {
+            request.setMethod("GET");
+            request.setRequestURI("/%61pi/v1/info/load/all");
+
+            assertThat(filter(true).shouldNotFilter(request)).isFalse();
+        }
+
+        @Test
+        @DisplayName("does not skip a percent-encoded API path under a context path")
+        void doesNotSkipEncodedApiPathUnderContextPath() {
+            request.setMethod("GET");
+            request.setContextPath("/app");
+            request.setRequestURI("/app/a%70i/v1/general/files/x.png");
+
+            assertThat(filter(true).shouldNotFilter(request)).isFalse();
+        }
+
+        @Test
+        @DisplayName("does not skip a malformed escape")
+        void doesNotSkipMalformedEscape() {
+            request.setMethod("GET");
+            request.setRequestURI("/%zz");
+
+            assertThat(filter(true).shouldNotFilter(request)).isFalse();
+        }
+
+        @Test
+        @DisplayName("still skips the frontend root on GET")
+        void skipsFrontendRootOnGet() {
+            request.setMethod("GET");
+            request.setRequestURI("/");
+
+            assertThat(filter(true).shouldNotFilter(request)).isTrue();
         }
     }
 }

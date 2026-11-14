@@ -21,6 +21,8 @@ import org.springframework.web.multipart.MultipartFile;
 
 import io.swagger.v3.oas.annotations.Operation;
 
+import jakarta.validation.Valid;
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
@@ -29,6 +31,9 @@ import stirling.software.SPDF.model.api.general.PosterPdfRequest;
 import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.GeneralApi;
 import stirling.software.common.enumeration.ResourceWeight;
+import stirling.software.common.model.tool.ToolArity;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.ExceptionUtils;
 import stirling.software.common.util.GeneralUtils;
@@ -41,6 +46,9 @@ import stirling.software.common.util.WebResponseUtils;
 @RequiredArgsConstructor
 public class PosterPdfController {
 
+    // Every output page stays in memory until the document is saved
+    private static final int MAX_OUTPUT_PAGES = 100_000;
+
     private final CustomPDFDocumentFactory pdfDocumentFactory;
     private final TempFileManager tempFileManager;
 
@@ -49,14 +57,14 @@ public class PosterPdfController {
             consumes = "multipart/form-data",
             resourceWeight = ResourceWeight.MEDIUM_WEIGHT)
     @MultiFileResponse
+    @ToolIO(produces = ToolFormat.PDF, arity = ToolArity.SIMO)
     @Operation(
             summary = "Split large PDF pages into smaller printable chunks",
             description =
-                    "This endpoint splits large or oddly-sized PDF pages into smaller chunks "
-                            + "suitable for printing on standard paper sizes (e.g., A4, Letter). "
-                            + "Divides each page into a grid of smaller pages using Apache PDFBox. "
-                            + "Input: PDF Output: ZIP-PDF Type: SISO")
-    public ResponseEntity<Resource> posterPdf(@ModelAttribute PosterPdfRequest request)
+                    "This endpoint splits large or oddly-sized PDF pages into smaller chunks"
+                            + " suitable for printing on standard paper sizes (e.g., A4, Letter). Divides each"
+                            + " page into a grid of smaller pages using Apache PDFBox.")
+    public ResponseEntity<Resource> posterPdf(@Valid @ModelAttribute PosterPdfRequest request)
             throws Exception {
 
         log.debug("Starting PDF poster split process with request: {}", request);
@@ -87,6 +95,15 @@ public class PosterPdfController {
                 int xFactor = request.getXFactor();
                 int yFactor = request.getYFactor();
                 boolean rightToLeft = request.isRightToLeft();
+
+                if ((long) totalPages * xFactor * yFactor > MAX_OUTPUT_PAGES) {
+                    throw ExceptionUtils.createIllegalArgumentException(
+                            "error.invalidArgument",
+                            "Invalid argument: {0}",
+                            "the poster grid would produce more than "
+                                    + MAX_OUTPUT_PAGES
+                                    + " pages");
+                }
 
                 log.debug(
                         "Processing {} pages with grid {}x{}, RTL={}",
@@ -230,7 +247,7 @@ public class PosterPdfController {
                 // Create ZIP from the PDF TempFile, streaming directly to zip TempFile
                 try (ZipOutputStream zipOut =
                         new ZipOutputStream(Files.newOutputStream(zipTempFile.getPath()))) {
-                    zipOut.putNextEntry(new ZipEntry(filename + "_poster.pdf"));
+                    zipOut.putNextEntry(new ZipEntry(filename + ".pdf"));
                     Files.copy(pdfTempFile.getPath(), zipOut);
                     zipOut.closeEntry();
                 }
@@ -238,7 +255,7 @@ public class PosterPdfController {
             }
 
             log.debug("Successfully created ZIP");
-            return WebResponseUtils.zipFileToWebResponse(zipTempFile, filename + "_poster.zip");
+            return WebResponseUtils.zipFileToWebResponse(zipTempFile, filename + ".zip");
 
         } catch (IOException e) {
             ExceptionUtils.logException("PDF poster split process", e);

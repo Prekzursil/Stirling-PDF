@@ -7,6 +7,7 @@ import static org.mockito.Mockito.when;
 
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Calendar;
 import java.util.GregorianCalendar;
 
@@ -15,6 +16,7 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.common.PDMetadata;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureTreeRoot;
 import org.apache.pdfbox.pdmodel.encryption.AccessPermission;
@@ -47,6 +49,7 @@ import org.springframework.web.multipart.MultipartFile;
 import stirling.software.SPDF.service.VeraPDFService;
 import stirling.software.common.model.api.PDFFile;
 import stirling.software.common.service.CustomPDFDocumentFactory;
+import stirling.software.common.util.XmpUtils;
 
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
@@ -265,18 +268,20 @@ class GetInfoOnPDFMoreTest {
     class Errors {
 
         @Test
-        @DisplayName("empty file input yields an error response")
-        void emptyFile() throws Exception {
-            MockMultipartFile mf =
-                    new MockMultipartFile("fileInput", "x.pdf", "application/pdf", new byte[0]);
-            PDFFile request = new PDFFile();
-            request.setFileInput(mf);
-            ResponseEntity<byte[]> resp = getInfoOnPDF.getPdfInfo(request);
-            // createErrorResponse returns HTTP 200 with a JSON body carrying an "error" field.
-            assertThat(resp.getBody()).isNotNull();
-            JsonNode body = om.readTree(resp.getBody());
-            assertThat(body.has("error")).isTrue();
-            assertThat(body.get("error").asText("")).contains("Invalid");
+        @DisplayName("an XMP packet over the parse limit is returned raw")
+        void oversizedXmpReturnedRaw() throws Exception {
+            PDDocument doc = new PDDocument();
+            doc.addPage(new PDPage(PDRectangle.A4));
+            PDMetadata metadata = new PDMetadata(doc);
+            metadata.importXMPMetadata(
+                    ("<!--" + "x".repeat(XmpUtils.MAX_XMP_BYTES) + "-->")
+                            .getBytes(StandardCharsets.US_ASCII));
+            doc.getDocumentCatalog().setMetadata(metadata);
+
+            JsonNode json = run(doc);
+
+            String xmp = json.path("Other").path("XMPMetadata").asText();
+            assertThat(xmp).startsWith("<!--").hasSizeGreaterThan(XmpUtils.MAX_XMP_BYTES);
         }
 
         @Test

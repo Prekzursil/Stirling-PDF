@@ -71,13 +71,15 @@ services:
     environment:
       # Basic settings
       DOCKER_ENABLE_SECURITY: "true"
+      # A fresh server signs in as the default admin and hides the SSO buttons.
+      SYSTEM_SETUPCOMPLETED: "true"
       SECURITY_ENABLELOGIN: "true"
       SECURITY_LOGINMETHOD: "${SECURITY_LOGINMETHOD:-all}"
       SYSTEM_DEFAULTLOCALE: en-US
       SYSTEM_BACKENDURL: "http://localhost:8080"
       PREMIUM_KEY: "${PREMIUM_KEY:-00000000-0000-0000-0000-000000000000}"
       PREMIUM_ENABLED: "true"
-      PREMIUM_PROFEATURES_SSOAUTOLOGIN: "${PREMIUM_PROFEATURES_SSOAUTOLOGIN:-false}"
+      SECURITY_SSOAUTOLOGIN: "${SECURITY_SSOAUTOLOGIN:-false}"
       UI_APPNAME: Stirling-PDF OAuth Test
       UI_HOMEDESCRIPTION: Keycloak OAuth2/OIDC Test Instance
       UI_APPNAMENAVBAR: Stirling-PDF OAuth

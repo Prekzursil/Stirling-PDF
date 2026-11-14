@@ -26,6 +26,8 @@ import stirling.software.SPDF.model.api.misc.MetadataRequest;
 import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.MiscApi;
 import stirling.software.common.enumeration.ResourceWeight;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.service.PdfMetadataService;
 import stirling.software.common.util.GeneralUtils;
@@ -62,12 +64,13 @@ public class MetadataController {
             value = "/update-metadata",
             resourceWeight = ResourceWeight.SMALL_WEIGHT)
     @StandardPdfResponse
+    @ToolIO(produces = ToolFormat.PDF)
     @Operation(
-            summary = "Update metadata of a PDF file",
+            summary = "Update a PDF's metadata",
             description =
-                    "This endpoint allows you to update the metadata of a given PDF file. You can"
-                            + " add, modify, or delete standard and custom metadata fields. Input:PDF"
-                            + " Output:PDF Type:SISO")
+                    "Standard fields left out are cleared, so send the current values of"
+                            + " the others too (see get-info-on-pdf). Dates use yyyy/MM/dd HH:mm:ss."
+                            + " deleteAll=true removes all metadata.")
     public ResponseEntity<Resource> metadata(@ModelAttribute MetadataRequest request)
             throws IOException {
 
@@ -186,7 +189,7 @@ public class MetadataController {
                     document,
                     GeneralUtils.removeExtension(
                                     Filenames.toSimpleFileName(pdfFile.getOriginalFilename()))
-                            + "_metadata.pdf",
+                            + ".pdf",
                     tempFileManager);
         }
     }

@@ -90,7 +90,11 @@ class AiWorkflowServiceMoreTest {
 
         PolicyExecutor policyExecutor =
                 new PolicyExecutor(
-                        internalApiClient, toolMetadataService, tempFileManager, objectMapper);
+                        internalApiClient,
+                        toolMetadataService,
+                        tempFileManager,
+                        objectMapper,
+                        new ApplicationProperties());
         service =
                 new AiWorkflowService(
                         pdfDocumentFactory,
@@ -218,34 +222,6 @@ class AiWorkflowServiceMoreTest {
                     service.orchestrate(requestFor(pdf("a.pdf", "x"), "ingest"));
             assertThat(result.getOutcome()).isEqualTo(AiWorkflowOutcome.CANNOT_CONTINUE);
             assertThat(result.getReason()).contains("nope.pdf");
-        }
-    }
-
-    @Nested
-    @DisplayName("convert_markdown guards")
-    class ConvertMarkdownGuards {
-
-        @Test
-        @DisplayName("no files listed yields CANNOT_CONTINUE")
-        void noFiles() throws IOException {
-            stubOrchestrator("{\"outcome\":\"convert_markdown\",\"filesToIngest\":[]}");
-            AiWorkflowResponse result = service.orchestrate(requestFor(pdf("a.pdf", "x"), "to md"));
-            assertThat(result.getOutcome()).isEqualTo(AiWorkflowOutcome.CANNOT_CONTINUE);
-        }
-
-        @Test
-        @DisplayName("unknown file id yields CANNOT_CONTINUE")
-        void unknownFile() throws IOException {
-            when(fileIdStrategy.idFor(any())).thenReturn("real-id");
-            stubOrchestrator(
-                    """
-                    {"outcome":"convert_markdown",
-                     "filesToIngest":[{"id":"other-id","name":"other.pdf"}]}
-                    """);
-            AiWorkflowResponse result =
-                    service.orchestrate(requestFor(pdf("real.pdf", "x"), "to md"));
-            assertThat(result.getOutcome()).isEqualTo(AiWorkflowOutcome.CANNOT_CONTINUE);
-            assertThat(result.getReason()).contains("other.pdf");
         }
     }
 

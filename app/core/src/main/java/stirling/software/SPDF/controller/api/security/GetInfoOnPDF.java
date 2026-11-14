@@ -9,6 +9,7 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 
+import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSInputStream;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.cos.COSString;
@@ -39,7 +40,6 @@ import org.apache.pdfbox.pdmodel.interactive.form.PDAcroForm;
 import org.apache.pdfbox.pdmodel.interactive.form.PDField;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.xmpbox.XMPMetadata;
-import org.apache.xmpbox.xml.DomXmpParser;
 import org.apache.xmpbox.xml.XmpParsingException;
 import org.apache.xmpbox.xml.XmpSerializer;
 import org.springframework.http.MediaType;
@@ -58,10 +58,12 @@ import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.SecurityApi;
 import stirling.software.common.enumeration.ResourceWeight;
 import stirling.software.common.model.api.PDFFile;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
-import stirling.software.common.util.ExceptionUtils;
 import stirling.software.common.util.RegexPatternUtils;
 import stirling.software.common.util.WebResponseUtils;
+import stirling.software.common.util.XmpUtils;
 
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.json.JsonMapper;
@@ -78,24 +80,29 @@ public class GetInfoOnPDF {
     private static final int MAX_LOGGED_ERRORS = 5;
     private static final String PAGE_PREFIX = "Page ";
     private static final long MAX_FILE_SIZE = 100L * 1024 * 1024;
+    private static final int MAX_OUTLINE_DEPTH = 64;
 
     private static final ObjectMapper objectMapper = JsonMapper.builder().build();
 
     private final CustomPDFDocumentFactory pdfDocumentFactory;
     private final VeraPDFService veraPDFService;
 
-    private static void addOutlinesToArray(PDOutlineItem outline, ArrayNode arrayNode) {
-        if (outline == null) return;
+    /**
+     * Outline links come from the file and can form cycles through /Next or /First, so each item is
+     * emitted once and nesting is capped.
+     */
+    private static void addOutlinesToArray(
+            PDOutlineItem outline, ArrayNode arrayNode, Set<COSDictionary> visited, int depth) {
+        if (outline == null || depth > MAX_OUTLINE_DEPTH || !visited.add(outline.getCOSObject())) {
+            return;
+        }
 
         ObjectNode outlineNode = objectMapper.createObjectNode();
         outlineNode.put("Title", outline.getTitle());
-        // You can add other properties if needed
         arrayNode.add(outlineNode);
 
-        PDOutlineItem child = outline.getFirstChild();
-        while (child != null) {
-            addOutlinesToArray(child, arrayNode);
-            child = child.getNextSibling();
+        for (PDOutlineItem child : outline.children()) {
+            addOutlinesToArray(child, arrayNode, visited, depth + 1);
         }
     }
 
@@ -218,19 +225,27 @@ public class GetInfoOnPDF {
         dimensionInfo.put("Height (cm)", String.format(Locale.ROOT, "%.2f", heightInCm));
     }
 
-    private static ArrayNode exploreStructureTree(List<Object> nodes) {
+    /**
+     * A structure element can be listed under /K many times or be its own ancestor, so each one is
+     * expanded once.
+     */
+    private static ArrayNode exploreStructureTree(List<Object> nodes, Set<COSDictionary> expanded) {
         ArrayNode elementsArray = objectMapper.createArrayNode();
         if (nodes != null) {
             for (Object obj : nodes) {
-                if (obj instanceof PDStructureNode node) {
+                if (obj instanceof PDStructureNode node && expanded.add(node.getCOSObject())) {
                     ObjectNode elementNode = objectMapper.createObjectNode();
 
                     if (node instanceof PDStructureElement structureElement) {
                         elementNode.put("Type", structureElement.getStructureType());
-                        elementNode.put("Content", getContent(structureElement));
+                        elementNode.put(
+                                "Content",
+                                getContent(
+                                        structureElement,
+                                        Collections.newSetFromMap(new IdentityHashMap<>())));
 
-                        // Recursively explore child elements
-                        ArrayNode childElements = exploreStructureTree(structureElement.getKids());
+                        ArrayNode childElements =
+                                exploreStructureTree(structureElement.getKids(), expanded);
                         if (!childElements.isEmpty()) {
                             elementNode.set("Children", childElements);
                         }
@@ -242,16 +257,18 @@ public class GetInfoOnPDF {
         return elementsArray;
     }
 
-    private static String getContent(PDStructureElement structureElement) {
+    private static String getContent(
+            PDStructureElement structureElement, Set<COSDictionary> visited) {
         StringBuilder contentBuilder = new StringBuilder();
+        if (!visited.add(structureElement.getCOSObject())) {
+            return "";
+        }
 
         for (Object item : structureElement.getKids()) {
             if (item instanceof COSString cosString) {
                 contentBuilder.append(cosString.getString());
             } else if (item instanceof PDStructureElement pdstructureelement) {
-                // For simplicity, we're handling only COSString and PDStructureElement here
-                // but a more comprehensive method would handle other types too
-                contentBuilder.append(getContent(pdstructureelement));
+                contentBuilder.append(getContent(pdstructureelement, visited));
             }
         }
 
@@ -265,25 +282,6 @@ public class GetInfoOnPDF {
             return zonedDateTime.format(formatter);
         } else {
             return null;
-        }
-    }
-
-    private static void validatePdfFile(MultipartFile file) {
-        if (file == null || file.isEmpty()) {
-            throw new IllegalArgumentException("PDF file is required");
-        }
-
-        if (file.getSize() > MAX_FILE_SIZE) {
-            throw ExceptionUtils.createIllegalArgumentException(
-                    "error.fileSizeLimit",
-                    "File size ({0} bytes) exceeds maximum allowed size ({1} bytes)",
-                    file.getSize(),
-                    MAX_FILE_SIZE);
-        }
-
-        String contentType = file.getContentType();
-        if (contentType != null && !"application/pdf".equals(contentType)) {
-            log.warn("File content type is {}, expected application/pdf", contentType);
         }
     }
 
@@ -304,6 +302,23 @@ public class GetInfoOnPDF {
             return ResponseEntity.internalServerError().build();
         }
     }
+
+    /**
+     * Info-dictionary keys exposed above via typed getters; any other key in the dictionary is
+     * surfaced as custom metadata (e.g. the classification policy's StirlingPDFClassification
+     * entry).
+     */
+    private static final java.util.Set<String> STANDARD_INFO_KEYS =
+            java.util.Set.of(
+                    "Title",
+                    "Author",
+                    "Subject",
+                    "Keywords",
+                    "Producer",
+                    "Creator",
+                    "CreationDate",
+                    "ModDate",
+                    "Trapped");
 
     private static ObjectNode extractMetadata(PDDocument document) {
         ObjectNode metadata = objectMapper.createObjectNode();
@@ -334,6 +349,18 @@ public class GetInfoOnPDF {
                                         : null);
                 if (modificationDate != null) {
                     metadata.put("ModificationDate", modificationDate);
+                }
+
+                // Surface custom Info-dictionary entries (anything beyond the
+                // standard fields above) — e.g. StirlingPDFClassification
+                for (String key : info.getMetadataKeys()) {
+                    if (STANDARD_INFO_KEYS.contains(key)) {
+                        continue;
+                    }
+                    String value = info.getCustomMetadataValue(key);
+                    if (value != null && !value.isBlank()) {
+                        metadata.put(key, value);
+                    }
                 }
             }
         } catch (Exception e) {
@@ -380,23 +407,24 @@ public class GetInfoOnPDF {
             for (PDFVerificationResult result : verificationResults) {
                 if (result == null) continue;
                 if (result.isCompliant()) {
-                    String std = result.getStandard().toLowerCase();
-                    if (std.contains("pdf_a") || std.contains("pdfa")) {
+                    // The id is short ("2b", "ua1"); the name reads "PDF/A-2B", so match on that.
+                    String std = standardFamily(result);
+                    boolean notPdfa = "not-pdfa".equals(result.getStandard());
+                    if (!notPdfa && (std.contains("pdfa") || result.isDeclaredPdfa())) {
                         isPdfA = true;
                         String profile = result.getValidationProfile();
                         if (profile != null) {
-                            if (profile.contains("1b")
-                                    || profile.contains("2b")
-                                    || profile.contains("3b")) {
+                            String p = profile.toLowerCase();
+                            if (p.contains("1b") || p.contains("2b") || p.contains("3b")) {
                                 isPdfB = true;
                             }
                             // Simple extraction: remove "pdfa-" prefix
                             pdfAConformanceLevel = profile.replace("pdfa-", "");
                         }
                     }
-                    if (std.contains("pdf_ua") || std.contains("pdfua")) isPdfUA = true;
-                    if (std.contains("pdf_x") || std.contains("pdfx")) isPdfX = true;
-                    if (std.contains("pdf_e") || std.contains("pdfe")) isPdfE = true;
+                    if (std.contains("pdfua")) isPdfUA = true;
+                    if (std.contains("pdfx")) isPdfX = true;
+                    if (std.contains("pdfe")) isPdfE = true;
                 }
             }
         }
@@ -428,6 +456,21 @@ public class GetInfoOnPDF {
         }
 
         return compliancy;
+    }
+
+    /** Lower-case letters and digits of the result's readable standard name, e.g. "pdfa2b". */
+    private static String standardFamily(PDFVerificationResult result) {
+        String name = result.getStandardName();
+        if (name == null || name.isBlank()) {
+            name = result.getValidationProfileName();
+        }
+        if (name == null || name.isBlank()) {
+            name = result.getStandard();
+        }
+        String family = name == null ? "" : name.toLowerCase().replaceAll("[^a-z0-9]", "");
+        String id = result.getStandard() == null ? "" : result.getStandard().toLowerCase();
+        // Bare veraPDF ids for PDF/UA ("ua1") carry no "pdf" prefix.
+        return id.startsWith("ua") ? "pdfua" + family : family;
     }
 
     private static boolean isSECCompliant(PDDocument doc) {
@@ -540,6 +583,15 @@ public class GetInfoOnPDF {
             ArrayNode attachmentsArray = extractAttachments(document);
             other.set("Attachments", attachmentsArray);
 
+            // Portfolio (Adobe PDF Collection): a /Collection dictionary in the catalog
+            org.apache.pdfbox.cos.COSBase collectionBase =
+                    catalog.getCOSObject().getDictionaryObject(COSName.getPDFName("Collection"));
+            other.put("IsPortfolio", collectionBase != null);
+            if (collectionBase instanceof org.apache.pdfbox.cos.COSDictionary collectionDict) {
+                COSName view = collectionDict.getCOSName(COSName.getPDFName("View"));
+                other.put("PortfolioView", view != null ? view.getName() : null);
+            }
+
             // JavaScript with security analysis
             ArrayNode javascriptArray = extractJavaScript(catalog);
             other.set("JavaScript", javascriptArray);
@@ -562,7 +614,9 @@ public class GetInfoOnPDF {
                         document.getDocumentCatalog().getStructureTreeRoot();
                 if (structureTreeRoot != null) {
                     ArrayNode structureTreeArray =
-                            exploreStructureTree(structureTreeRoot.getKids());
+                            exploreStructureTree(
+                                    structureTreeRoot.getKids(),
+                                    Collections.newSetFromMap(new IdentityHashMap<>()));
                     other.set("StructureTree", structureTreeArray);
                 }
             } catch (Exception e) {
@@ -717,8 +771,9 @@ public class GetInfoOnPDF {
         try {
             PDOutlineNode root = document.getDocumentCatalog().getDocumentOutline();
             if (root != null) {
+                Set<COSDictionary> visited = Collections.newSetFromMap(new IdentityHashMap<>());
                 for (PDOutlineItem child : root.children()) {
-                    addOutlinesToArray(child, bookmarksArray);
+                    addOutlinesToArray(child, bookmarksArray, visited, 0);
                 }
             }
         } catch (Exception e) {
@@ -735,15 +790,12 @@ public class GetInfoOnPDF {
             PDMetadata pdMetadata = document.getDocumentCatalog().getMetadata();
             if (pdMetadata != null) {
                 try {
-                    try (COSInputStream inputStream = pdMetadata.createInputStream()) {
-                        DomXmpParser domXmpParser = new DomXmpParser();
-                        XMPMetadata xmpMeta = domXmpParser.parse(inputStream);
+                    XMPMetadata xmpMeta = XmpUtils.parse(pdMetadata, true);
 
-                        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                        new XmpSerializer().serialize(xmpMeta, outputStream, true);
-                        xmpString = outputStream.toString(StandardCharsets.UTF_8);
-                    }
-                } catch (XmpParsingException e) {
+                    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                    new XmpSerializer().serialize(xmpMeta, outputStream, true);
+                    xmpString = outputStream.toString(StandardCharsets.UTF_8);
+                } catch (XmpParsingException | IOException e) {
                     log.debug("XMP parsing failed, reading raw metadata: {}", e.getMessage());
                     try (COSInputStream inputStream = pdMetadata.createInputStream()) {
                         byte[] metadataBytes = inputStream.readAllBytes();
@@ -1066,20 +1118,12 @@ public class GetInfoOnPDF {
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             value = "/get-info-on-pdf",
             resourceWeight = ResourceWeight.MEDIUM_WEIGHT)
+    @ToolIO(produces = ToolFormat.JSON)
     @Operation(
             summary = "Get comprehensive PDF information",
-            description =
-                    "Extracts all available information from a PDF file. Input:PDF Output:JSON Type:SISO")
+            description = "Extracts all available information from a PDF file.")
     public ResponseEntity<byte[]> getPdfInfo(@ModelAttribute PDFFile request) throws IOException {
         MultipartFile inputFile = request.getFileInput();
-
-        // Validate input
-        try {
-            validatePdfFile(inputFile);
-        } catch (IllegalArgumentException e) {
-            log.error("Invalid PDF file: {}", e.getMessage());
-            return createErrorResponse("Invalid PDF file: " + e.getMessage());
-        }
 
         List<PDFVerificationResult> verificationResults = null;
         try {

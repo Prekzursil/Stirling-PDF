@@ -3,16 +3,20 @@ package stirling.software.proprietary.security.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.sql.SQLException;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
+import org.hibernate.KeyType;
+import org.hibernate.Session;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -30,6 +34,8 @@ import org.springframework.security.core.session.SessionInformation;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import jakarta.persistence.EntityManager;
+
 import stirling.software.common.model.ApplicationProperties;
 import stirling.software.common.model.enumeration.Role;
 import stirling.software.common.model.exception.UnsupportedProviderException;
@@ -41,6 +47,7 @@ import stirling.software.proprietary.security.model.AuthenticationType;
 import stirling.software.proprietary.security.model.Authority;
 import stirling.software.proprietary.security.model.User;
 import stirling.software.proprietary.security.repository.TeamRepository;
+import stirling.software.proprietary.security.service.ApiKeyAuthenticationService.ApiKeyAuthentication;
 import stirling.software.proprietary.security.session.SessionPersistentRegistry;
 import stirling.software.proprietary.storage.repository.FileShareAccessRepository;
 import stirling.software.proprietary.storage.repository.FileShareRepository;
@@ -55,6 +62,7 @@ import stirling.software.proprietary.workflow.service.UserServerCertificateServi
 class UserServiceMoreTest {
 
     @Mock private UserRepository userRepository;
+    @Mock private EntityManager entityManager;
     @Mock private TeamRepository teamRepository;
     @Mock private AuthorityRepository authorityRepository;
     @Mock private PasswordEncoder passwordEncoder;
@@ -70,6 +78,15 @@ class UserServiceMoreTest {
     @Mock private StorageCleanupEntryRepository storageCleanupEntryRepository;
     @Mock private FileShareRepository fileShareRepository;
     @Mock private FileShareAccessRepository fileShareAccessRepository;
+
+    @Mock
+    private stirling.software.proprietary.integration.repository.IntegrationConfigRepository
+            integrationConfigRepository;
+
+    @Mock private TeamMembershipService teamMembershipService;
+    @Mock private ApiKeyAuthenticationService apiKeyAuthenticationService;
+
+    @org.mockito.Mock private stirling.software.proprietary.service.OrgOwnerService orgOwnerService;
 
     @InjectMocks private UserService userService;
 
@@ -93,7 +110,8 @@ class UserServiceMoreTest {
         void getAuthenticationValid() {
             User u = user("api");
             u.addAuthority(new Authority("ROLE_USER", u));
-            when(userRepository.findByApiKey("k")).thenReturn(Optional.of(u));
+            when(apiKeyAuthenticationService.authenticate("k"))
+                    .thenReturn(Optional.of(new ApiKeyAuthentication(u, null, u.getAuthorities())));
 
             assertThat(userService.getAuthentication("k")).isNotNull();
         }
@@ -101,7 +119,7 @@ class UserServiceMoreTest {
         @Test
         @DisplayName("getAuthentication throws when key is unknown")
         void getAuthenticationInvalid() {
-            when(userRepository.findByApiKey("bad")).thenReturn(Optional.empty());
+            when(apiKeyAuthenticationService.authenticate("bad")).thenReturn(Optional.empty());
 
             assertThatThrownBy(() -> userService.getAuthentication("bad"))
                     .isInstanceOf(UsernameNotFoundException.class);
@@ -148,7 +166,10 @@ class UserServiceMoreTest {
         @Test
         @DisplayName("usernameExists true when found")
         void usernameExists() {
-            when(userRepository.findByUsername("a")).thenReturn(Optional.of(user("a")));
+            User found = user("a");
+            Session session = mock(Session.class);
+            when(entityManager.unwrap(Session.class)).thenReturn(session);
+            when(session.find(User.class, "a", KeyType.NATURAL)).thenReturn(found);
             assertThat(userService.usernameExists("a")).isTrue();
         }
 
@@ -249,7 +270,8 @@ class UserServiceMoreTest {
             User u = user("p");
             Team defaultTeam = new Team();
             defaultTeam.setName("Default");
-            when(teamRepository.findByName("Default")).thenReturn(Optional.of(defaultTeam));
+            when(teamRepository.findFirstByNameOrderByIdAsc("Default"))
+                    .thenReturn(Optional.of(defaultTeam));
 
             userService.changeUserTeam(u, null);
 
@@ -363,7 +385,7 @@ class UserServiceMoreTest {
     class SettingsAndSessions {
 
         @Test
-        @DisplayName("updateUserSettings replaces the settings map and exports")
+        @DisplayName("updateUserSettings writes preference keys and exports")
         void updateUserSettings() throws SQLException, UnsupportedProviderException {
             User u = user("p");
             when(userRepository.findByUsernameIgnoreCaseWithSettings("p"))
@@ -374,6 +396,34 @@ class UserServiceMoreTest {
             assertThat(u.getSettings()).containsEntry("theme", "dark");
             verify(userRepository).save(u);
             verify(databaseService).exportDatabase();
+        }
+
+        @Test
+        @DisplayName("updateUserSettings cannot clear or overwrite MFA state")
+        void updateUserSettingsKeepsMfaState() throws SQLException, UnsupportedProviderException {
+            User u = user("p");
+            u.setSettings(
+                    new HashMap<>(
+                            Map.of(
+                                    "mfaEnabled",
+                                    "true",
+                                    "mfaSecret",
+                                    "original-secret",
+                                    "loginLandingView",
+                                    "files",
+                                    "theme",
+                                    "light")));
+            when(userRepository.findByUsernameIgnoreCaseWithSettings("p"))
+                    .thenReturn(Optional.of(u));
+
+            userService.updateUserSettings(
+                    "p", Map.of("mfaEnabled", "false", "mfaSecret", "attacker", "theme", "dark"));
+
+            assertThat(u.getSettings())
+                    .containsEntry("mfaEnabled", "true")
+                    .containsEntry("mfaSecret", "original-secret")
+                    .containsEntry("loginLandingView", "files")
+                    .containsEntry("theme", "dark");
         }
 
         @Test

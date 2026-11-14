@@ -1,11 +1,17 @@
 package stirling.software.proprietary.security;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
 import java.sql.SQLException;
 import java.util.Collections;
 import java.util.Optional;
@@ -15,17 +21,21 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
+import org.mockito.MockedStatic;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.core.env.Environment;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import stirling.software.common.model.ApplicationProperties;
 import stirling.software.common.model.enumeration.Role;
 import stirling.software.common.model.exception.UnsupportedProviderException;
+import stirling.software.common.util.GeneralUtils;
 import stirling.software.proprietary.model.Team;
 import stirling.software.proprietary.security.model.User;
 import stirling.software.proprietary.security.service.DatabaseServiceInterface;
 import stirling.software.proprietary.security.service.SaveUserRequest;
+import stirling.software.proprietary.security.service.TeamMembershipService;
 import stirling.software.proprietary.security.service.TeamService;
 import stirling.software.proprietary.security.service.UserService;
 import stirling.software.proprietary.service.UserLicenseSettingsService;
@@ -38,6 +48,7 @@ class InitialSecuritySetupTest {
     @Mock private DatabaseServiceInterface databaseService;
     @Mock private UserLicenseSettingsService licenseSettingsService;
     @Mock private Environment environment;
+    @Mock private TeamMembershipService teamMembershipService;
 
     private ApplicationProperties applicationProperties;
     private InitialSecuritySetup initialSecuritySetup;
@@ -63,7 +74,8 @@ class InitialSecuritySetupTest {
                         applicationProperties,
                         databaseService,
                         licenseSettingsService,
-                        environment);
+                        environment,
+                        teamMembershipService);
     }
 
     @Test
@@ -105,6 +117,27 @@ class InitialSecuritySetupTest {
     }
 
     @Test
+    void initRetriesUntilPeerRacesStopColliding() {
+        // Cluster cold boot: peers collide on a different row each pass, so one retry is not
+        // enough. Two collisions then success proves the loop converges instead of exiting.
+        when(userService.hasUsers()).thenReturn(true);
+        when(userService.getUsersWithoutTeam()).thenReturn(Collections.emptyList());
+        when(userService.usernameExistsIgnoreCase(any())).thenReturn(true);
+        doThrow(new DataIntegrityViolationException("duplicate key: users_username_key"))
+                .doThrow(
+                        new DataIntegrityViolationException("duplicate key: license_settings_pkey"))
+                .doNothing()
+                .when(licenseSettingsService)
+                .initializeGrandfatheredCount();
+
+        initialSecuritySetup.init();
+
+        verify(licenseSettingsService, times(3)).initializeGrandfatheredCount();
+        // Only the pass that got through may complete the remaining steps.
+        verify(licenseSettingsService, times(1)).updateLicenseMaxUsers();
+    }
+
+    @Test
     void configureJwtSettingsDisablesKeyCleanupWhenJwtDisabled() {
         ReflectionTestUtils.setField(initialSecuritySetup, "v2Enabled", true);
         applicationProperties.getSecurity().getJwt().setEnableKeystore(false);
@@ -115,5 +148,39 @@ class InitialSecuritySetupTest {
         initialSecuritySetup.init();
 
         assertThat(applicationProperties.getSecurity().getJwt().isEnableKeyCleanup()).isFalse();
+    }
+
+    /** An existing server's startup, as far as the setup check, with the admin stubbed in. */
+    private void startExistingServer(boolean adminPastFirstLogin) {
+        applicationProperties.getSystem().setSetupCompleted(false);
+        when(userService.hasUsers()).thenReturn(true);
+        when(userService.getUsersWithoutTeam()).thenReturn(Collections.emptyList());
+        when(userService.usernameExistsIgnoreCase(Role.INTERNAL_API_USER.getRoleId()))
+                .thenReturn(true);
+        when(userService.hasAdminPastFirstLogin()).thenReturn(adminPastFirstLogin);
+    }
+
+    @Test
+    void initMarksAServerWhoseAdminHasTheirOwnPasswordAsSetUp() {
+        startExistingServer(true);
+        try (MockedStatic<GeneralUtils> settings = mockStatic(GeneralUtils.class)) {
+            settings.when(() -> GeneralUtils.saveKeyToSettings("system.setupCompleted", true))
+                    .thenThrow(new IOException("read-only file system"));
+
+            initialSecuritySetup.init();
+
+            assertTrue(applicationProperties.getSystem().isSetupCompleted());
+        }
+    }
+
+    @Test
+    void initLeavesANewServerToFirstRunSetup() {
+        startExistingServer(false);
+        try (MockedStatic<GeneralUtils> settings = mockStatic(GeneralUtils.class)) {
+            initialSecuritySetup.init();
+
+            assertFalse(applicationProperties.getSystem().isSetupCompleted());
+            settings.verifyNoInteractions();
+        }
     }
 }

@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -17,6 +18,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -162,7 +164,7 @@ class RemoveImagesControllerTest {
     /** Counts every PDImageXObject reachable through page + nested form resources. */
     private int countImagesInSavedOutput() throws IOException {
         assertFalse(savedTempFiles.isEmpty(), "expected the controller to create a temp file");
-        File out = savedTempFiles.get(savedTempFiles.size() - 1);
+        File out = savedTempFiles.getLast();
         try (PDDocument doc = Loader.loadPDF(out)) {
             int count = 0;
             for (PDPage page : doc.getPages()) {
@@ -245,7 +247,7 @@ class RemoveImagesControllerTest {
 
             assertEquals(0, countImagesInSavedOutput());
             // page count must be preserved
-            File out = savedTempFiles.get(savedTempFiles.size() - 1);
+            File out = savedTempFiles.getLast();
             try (PDDocument result = Loader.loadPDF(out)) {
                 assertEquals(3, result.getNumberOfPages());
             }
@@ -366,7 +368,7 @@ class RemoveImagesControllerTest {
     class Filenames {
 
         @Test
-        @DisplayName("appends _images_removed.pdf suffix to the original name")
+        @DisplayName("keeps the original name")
         void appendsSuffix() throws IOException {
             byte[] bytes = pdfWithImagesBytes(1);
             MockMultipartFile file = multipart("report.pdf", bytes);
@@ -387,8 +389,7 @@ class RemoveImagesControllerTest {
                         () ->
                                 WebResponseUtils.pdfFileToWebResponse(
                                         any(TempFile.class),
-                                        org.mockito.ArgumentMatchers.eq(
-                                                "report_images_removed.pdf")));
+                                        org.mockito.ArgumentMatchers.eq("report.pdf")));
             }
         }
 
@@ -439,6 +440,31 @@ class RemoveImagesControllerTest {
 
             assertThrows(IOException.class, () -> controller.removeImages(req));
         }
+    }
+
+    @Test
+    @DisplayName("A form shared under many names, or naming itself, is processed once")
+    void sharedAndSelfReferencingForms() throws Exception {
+        PDDocument doc = new PDDocument();
+        PDFormXObject inner = new PDFormXObject(doc);
+        inner.setResources(new PDResources());
+        inner.getResources()
+                .put(COSName.getPDFName("Im"), JPEGFactory.createFromImage(doc, tinyImage()));
+        inner.getResources().put(COSName.getPDFName("Self"), inner);
+        PDPage page = new PDPage(PDRectangle.LETTER);
+        page.setResources(new PDResources());
+        for (int i = 0; i < 4; i++) {
+            page.getResources().put(COSName.getPDFName("F" + i), inner);
+        }
+        doc.addPage(page);
+        PDFFile req = request(multipart("shared.pdf", new byte[] {1}));
+        when(pdfDocumentFactory.load(req)).thenReturn(doc);
+
+        assertTimeoutPreemptively(Duration.ofSeconds(10), () -> controller.removeImages(req));
+
+        List<COSName> remaining = new ArrayList<>();
+        inner.getResources().getXObjectNames().forEach(remaining::add);
+        assertEquals(List.of(COSName.getPDFName("Self")), remaining);
     }
 
     private static ResponseEntity<Resource> okResponse() {

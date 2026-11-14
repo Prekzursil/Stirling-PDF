@@ -34,11 +34,15 @@ import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.MiscApi;
 import stirling.software.common.enumeration.ResourceWeight;
 import stirling.software.common.model.ApplicationProperties;
+import stirling.software.common.model.tool.ToolArity;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.ApplicationContextProvider;
 import stirling.software.common.util.CheckProgramInstall;
 import stirling.software.common.util.ExceptionUtils;
 import stirling.software.common.util.GeneralUtils;
+import stirling.software.common.util.LimitedPDFRenderer;
 import stirling.software.common.util.ProcessExecutor;
 import stirling.software.common.util.ProcessExecutor.ProcessExecutorResult;
 import stirling.software.common.util.TempFile;
@@ -50,6 +54,9 @@ import stirling.software.common.util.WebResponseUtils;
 @RequiredArgsConstructor
 public class ExtractImageScansController {
 
+    // Print-quality raster for the extracted scan; capped by system maxDPI
+    private static final int SCAN_RENDER_DPI = 300;
+
     private static final String REPLACEFIRST = "[.][^.]+$";
 
     private final CustomPDFDocumentFactory pdfDocumentFactory;
@@ -60,13 +67,20 @@ public class ExtractImageScansController {
             value = "/extract-image-scans",
             resourceWeight = ResourceWeight.LARGE_WEIGHT)
     @MultiFileResponse
+    // split_photos.py uses OpenCV imread, which cannot read the vector/PSD formats in IMAGE.
+    @ToolIO(
+            accepts = {ToolFormat.PDF, ToolFormat.IMAGE},
+            inputExtensions = {
+                "pdf", "bmp", "dib", "gif", "jpeg", "jpg", "jpe", "jp2", "png", "webp", "avif",
+                "pbm", "pgm", "ppm", "pxm", "pnm", "pfm", "sr", "ras", "tiff", "tif", "hdr", "pic"
+            },
+            produces = ToolFormat.IMAGE,
+            arity = ToolArity.SIMO)
     @Operation(
-            summary = "Extract image scans from an input file",
+            summary = "Extract photos scanned together on one page into separate images",
             description =
-                    "This endpoint extracts image scans from a given file based on certain"
-                            + " parameters. Users can specify angle threshold, tolerance, minimum area,"
-                            + " minimum contour area, and border size. Input:PDF Output:IMAGE/ZIP"
-                            + " Type:SIMO")
+                    "Finds, crops and straightens each photo on every page or image."
+                            + " Returns one PNG, or a zip when several are found.")
     public ResponseEntity<Resource> extractImageScans(
             @ModelAttribute ExtractImageScansRequest request)
             throws IOException, InterruptedException {
@@ -95,7 +109,7 @@ public class ExtractImageScansController {
             if ("pdf".equalsIgnoreCase(extension)) {
                 // Load PDF document
                 try (PDDocument document = pdfDocumentFactory.load(inputFile)) {
-                    PDFRenderer pdfRenderer = new PDFRenderer(document);
+                    PDFRenderer pdfRenderer = new LimitedPDFRenderer(document);
                     pdfRenderer.setSubsamplingAllowed(true);
                     int pageCount = document.getNumberOfPages();
                     images = new ArrayList<>();
@@ -109,12 +123,12 @@ public class ExtractImageScansController {
                         // Render image and save as temp file
                         BufferedImage image;
 
-                        // Use global maximum DPI setting, fallback to 300 if not set
-                        int renderDpi = 300; // Default fallback
+                        // maxDPI is a safety ceiling for user-supplied values, not a target
+                        int renderDpi = SCAN_RENDER_DPI;
                         ApplicationProperties properties =
                                 ApplicationContextProvider.getBean(ApplicationProperties.class);
                         if (properties != null && properties.getSystem() != null) {
-                            renderDpi = properties.getSystem().getMaxDPI();
+                            renderDpi = Math.min(renderDpi, properties.getSystem().getMaxDPI());
                         }
                         final int dpi = renderDpi;
                         final int pageIndex = i;
@@ -211,7 +225,7 @@ public class ExtractImageScansController {
             } else {
 
                 // Return the processed image as a response
-                byte[] imageBytes = processedImageBytes.get(0);
+                byte[] imageBytes = processedImageBytes.getFirst();
                 finalOutput = tempFileManager.createManagedTempFile(".png");
                 try (OutputStream out = Files.newOutputStream(finalOutput.getPath())) {
                     out.write(imageBytes);

@@ -23,6 +23,7 @@ import lombok.extern.slf4j.Slf4j;
 import stirling.software.SPDF.model.Dependency;
 import stirling.software.SPDF.model.SignatureFile;
 import stirling.software.SPDF.service.SharedSignatureService;
+import stirling.software.SPDF.util.NativeLicenseLoader;
 import stirling.software.common.annotations.api.UiDataApi;
 import stirling.software.common.configuration.InstallationPathConfig;
 import stirling.software.common.configuration.RuntimePathConfig;
@@ -31,6 +32,7 @@ import stirling.software.common.service.UserServiceInterface;
 import stirling.software.common.util.ExceptionUtils;
 import stirling.software.common.util.GeneralUtils;
 
+import tools.jackson.core.JacksonException;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
@@ -91,16 +93,36 @@ public class UIDataController {
     @Operation(summary = "Get third-party licenses data")
     public ResponseEntity<LicensesData> getLicensesData() {
         LicensesData data = new LicensesData();
-        Resource resource = new ClassPathResource("static/3rdPartyLicenses.json");
-
-        try (InputStream is = resource.getInputStream()) {
-            Map<String, List<Dependency>> licenseData =
-                    objectMapper.readValue(is, new TypeReference<>() {});
-            data.setDependencies(licenseData.get("dependencies"));
-        } catch (IOException e) {
+        List<Dependency> combined = new ArrayList<>();
+        try {
+            Resource resource = new ClassPathResource("static/3rdPartyLicenses.json");
+            try (InputStream is = resource.getInputStream()) {
+                Map<String, List<Dependency>> licenseData =
+                        objectMapper.readValue(
+                                is, new TypeReference<Map<String, List<Dependency>>>() {});
+                // A report containing JSON null parses without error but yields no map.
+                if (licenseData != null) {
+                    List<Dependency> dependencies = licenseData.get("dependencies");
+                    if (dependencies != null) {
+                        combined.addAll(dependencies);
+                    }
+                }
+            }
+        } catch (IOException | JacksonException e) {
+            // Jackson 3 reports malformed JSON with an unchecked JacksonException,
+            // which must not suppress the native notices loaded below.
             log.error("Failed to load licenses data", e);
-            data.setDependencies(Collections.emptyList());
         }
+        try {
+            // Resource discovery follows the thread context loader, which hosted
+            // runtimes and tests both control.
+            combined.addAll(
+                    NativeLicenseLoader.loadNativeLicenses(
+                            Thread.currentThread().getContextClassLoader()));
+        } catch (RuntimeException e) {
+            log.warn("Unable to load JPDFium native licenses", e);
+        }
+        data.setDependencies(combined);
 
         return ResponseEntity.ok(data);
     }
@@ -125,17 +147,14 @@ public class UIDataController {
                     pipelineConfigs.add(content);
                 }
 
-                for (String config : pipelineConfigs) {
+                for (int i = 0; i < jsonFiles.size(); i++) {
+                    String config = pipelineConfigs.get(i);
                     Map<String, Object> jsonContent =
                             objectMapper.readValue(
                                     config, new TypeReference<Map<String, Object>>() {});
                     String name = (String) jsonContent.get("name");
-                    if (name == null || name.length() < 1) {
-                        String filename =
-                                jsonFiles
-                                        .get(pipelineConfigs.indexOf(config))
-                                        .getFileName()
-                                        .toString();
+                    if (name == null || name.isEmpty()) {
+                        String filename = jsonFiles.get(i).getFileName().toString();
                         name = filename.substring(0, filename.lastIndexOf('.'));
                     }
                     Map<String, String> configWithName = new HashMap<>();
@@ -301,20 +320,14 @@ public class UIDataController {
         }
 
         private static String getFormatFromExtension(String extension) {
-            switch (extension) {
-                case "ttf":
-                    return "truetype";
-                case "woff":
-                    return "woff";
-                case "woff2":
-                    return "woff2";
-                case "eot":
-                    return "embedded-opentype";
-                case "svg":
-                    return "svg";
-                default:
-                    return "";
-            }
+            return switch (extension) {
+                case "ttf" -> "truetype";
+                case "woff" -> "woff";
+                case "woff2" -> "woff2";
+                case "eot" -> "embedded-opentype";
+                case "svg" -> "svg";
+                default -> "";
+            };
         }
     }
 }

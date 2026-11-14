@@ -1,9 +1,12 @@
 package stirling.software.common.util;
 
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
+
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.util.concurrent.UncheckedExecutionException;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -11,7 +14,9 @@ import lombok.extern.slf4j.Slf4j;
 public final class RegexPatternUtils {
 
     private static final RegexPatternUtils INSTANCE = new RegexPatternUtils();
-    private final ConcurrentHashMap<PatternKey, Pattern> patternCache = new ConcurrentHashMap<>();
+    private static final long MAX_CACHED_PATTERNS = 512;
+    private final Cache<PatternKey, Pattern> patternCache =
+            CacheBuilder.newBuilder().maximumSize(MAX_CACHED_PATTERNS).build();
 
     private static final String WHITESPACE_REGEX = "\\s++";
     private static final String EXTENSION_REGEX = "\\.(?:[^.]*+)?$";
@@ -51,7 +56,7 @@ public final class RegexPatternUtils {
             throw new IllegalArgumentException("Regex pattern cannot be null");
         }
 
-        return patternCache.computeIfAbsent(new PatternKey(regex, 0), this::compilePattern);
+        return getOrCompile(new PatternKey(regex, 0));
     }
 
     /**
@@ -77,7 +82,7 @@ public final class RegexPatternUtils {
             throw new IllegalArgumentException("Regex pattern cannot be null");
         }
 
-        return patternCache.computeIfAbsent(new PatternKey(regex, flags), this::compilePattern);
+        return getOrCompile(new PatternKey(regex, flags));
     }
 
     /**
@@ -98,7 +103,7 @@ public final class RegexPatternUtils {
      * @return true if pattern is cached, false otherwise
      */
     public boolean isCached(String regex, int flags) {
-        return regex != null && patternCache.containsKey(new PatternKey(regex, flags));
+        return regex != null && patternCache.getIfPresent(new PatternKey(regex, flags)) != null;
     }
 
     /**
@@ -107,7 +112,7 @@ public final class RegexPatternUtils {
      * @return number of patterns currently cached
      */
     public int getCacheSize() {
-        return patternCache.size();
+        return (int) patternCache.size();
     }
 
     /**
@@ -115,7 +120,7 @@ public final class RegexPatternUtils {
      * useful for testing or memory cleanup in long-running applications.
      */
     public void clearCache() {
-        patternCache.clear();
+        patternCache.invalidateAll();
         log.debug("Regex pattern cache cleared");
     }
 
@@ -141,11 +146,30 @@ public final class RegexPatternUtils {
             return false;
         }
         PatternKey key = new PatternKey(regex, flags);
-        boolean removed = patternCache.remove(key) != null;
+        boolean removed = patternCache.getIfPresent(key) != null;
+        patternCache.invalidate(key);
         if (removed) {
             log.debug("Removed regex pattern from cache: {} (flags: {})", regex, flags);
         }
         return removed;
+    }
+
+    private Pattern getOrCompile(PatternKey key) {
+        try {
+            return patternCache.get(key, () -> compilePattern(key));
+        } catch (UncheckedExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof PatternSyntaxException patternSyntaxException) {
+                throw patternSyntaxException;
+            }
+            throw e;
+        } catch (java.util.concurrent.ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof PatternSyntaxException patternSyntaxException) {
+                throw patternSyntaxException;
+            }
+            throw new IllegalStateException("Failed to compile regex pattern", cause);
+        }
     }
 
     /**
@@ -163,8 +187,13 @@ public final class RegexPatternUtils {
             log.trace("Compiled and cached regex pattern with flags {}: {}", flags, regex);
             return pattern;
         } catch (PatternSyntaxException e) {
-            log.error(
-                    "Invalid regex pattern: '{}' with flags {} - {}", regex, flags, e.getMessage());
+            // Patterns can be user input such as auto-redact search terms, so the pattern text
+            // stays out of the log; getMessage() would include it.
+            log.warn(
+                    "Invalid regex pattern with flags {}: {} near index {}",
+                    flags,
+                    e.getDescription(),
+                    e.getIndex());
             throw e;
         }
     }
@@ -414,9 +443,13 @@ public final class RegexPatternUtils {
         return getPattern("(https?://[\\w\\-._~:/?#\\[\\]@!$&'()*+,;=%]+)");
     }
 
-    /** Pattern for matching email addresses in text for link creation */
+    /**
+     * Pattern for matching email addresses in text for link creation. Anchored to the start of a
+     * local-part run so each run is scanned once.
+     */
     public Pattern getEmailLinkPattern() {
-        return getPattern("([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,63})");
+        return getPattern(
+                "(?<![a-zA-Z0-9._%+-])([a-zA-Z0-9._%+-]++@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,63})");
     }
 
     /** Pattern for removing script tags from HTML */
@@ -429,14 +462,14 @@ public final class RegexPatternUtils {
         return getPattern("(?i)<style[^>]*>.*?</style>");
     }
 
-    /** Pattern for removing fixed position CSS */
+    /** Pattern for removing fixed position CSS. Anchored to the start of a whitespace run. */
     public Pattern getFixedPositionCssPattern() {
-        return getPattern("(?i)\\s*position\\s*:\\s*fixed[^;]*;?");
+        return getPattern("(?i)(?<!\\s)\\s*+position\\s*:\\s*fixed[^;]*;?");
     }
 
-    /** Pattern for removing absolute position CSS */
+    /** Pattern for removing absolute position CSS. Anchored to the start of a whitespace run. */
     public Pattern getAbsolutePositionCssPattern() {
-        return getPattern("(?i)\\s*position\\s*:\\s*absolute[^;]*;?");
+        return getPattern("(?i)(?<!\\s)\\s*+position\\s*:\\s*absolute[^;]*;?");
     }
 
     /** Pattern for matching size unit suffixes (KB, MB, GB, etc.) */
@@ -459,9 +492,12 @@ public final class RegexPatternUtils {
         return getPattern("[\\s\\(\\)]+");
     }
 
-    /** Pattern for MIME header whitespace cleanup before encoded sequences */
+    /**
+     * Pattern for MIME header whitespace cleanup before encoded sequences. Anchored to the start of
+     * a whitespace run.
+     */
     public Pattern getMimeHeaderWhitespacePattern() {
-        return getPattern("\\s+(?==\\?)");
+        return getPattern("(?<!\\s)\\s++(?==\\?)");
     }
 
     /** Pattern for font name validation (6 uppercase letters + plus + rest) */
@@ -537,10 +573,6 @@ public final class RegexPatternUtils {
         getPattern("[/\\\\?%*:|\"<>]"); // Unsafe filename characters
         getPattern("[^a-zA-Z0-9 ]"); // Input sanitization
         getPattern("[^a-zA-Z0-9]"); // Filename sanitization
-        // API doc patterns
-        getPattern("Output:\\s*(\\w+)");
-        getPattern("Input:\\s*(\\w+)");
-        getPattern("Type:\\s*(\\w+)");
         log.debug("Pre-compiled {} common regex patterns", patternCache.size());
     }
 
@@ -548,23 +580,6 @@ public final class RegexPatternUtils {
     public Pattern getEmailValidationPattern() {
         return getPattern(
                 "^(?=.{1,320}$)(?=.{1,64}@)[A-Za-z0-9](?:[A-Za-z0-9_.+-]*[A-Za-z0-9])?@[^-][A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*(?:\\.[A-Za-z]{2,})$");
-    }
-
-    /* Pattern for matching Output:<TYPE> in API descriptions */
-    public Pattern getApiDocOutputTypePattern() {
-        return getPattern("Output:\\s*(\\w+)");
-    }
-
-    /* Pattern for matching Input:<TYPE> in API descriptions */
-    public Pattern getApiDocInputTypePattern() {
-        return getPattern("Input:\\s*(\\w+)");
-    }
-
-    /**
-     * Pattern for matching Type:<CODE> in API descriptions
-     */
-    public Pattern getApiDocTypePattern() {
-        return getPattern("Type:\\s*(\\w+)");
     }
 
     /* Pattern for validating file extensions (2-4 alphanumeric, case-insensitive) */

@@ -1,17 +1,37 @@
 package stirling.software.common.util;
 
+import java.nio.charset.StandardCharsets;
+import java.util.regex.Pattern;
+
+import org.springframework.web.util.UriUtils;
+
 public class RequestUriUtils {
+
+    // Share tokens are 36-char lowercase UUIDs (UUID.randomUUID().toString()); match exactly
+    private static final Pattern SHARE_LINK_PATTERN =
+            Pattern.compile(
+                    "^/share/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/?$");
+    // Share-link download (not /metadata or /accessed); token format as above
+    private static final Pattern SHARE_LINK_API_PATTERN =
+            Pattern.compile(
+                    "^/api/v1/storage/share-links/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+    // The phone's two mobile-scanner calls, matched exactly so only a bare session id passes
+    private static final Pattern MOBILE_SCANNER_PHONE_PATTERN =
+            Pattern.compile("^/api/v1/mobile-scanner/(validate-session|upload)/[A-Za-z0-9-]+$");
+    // Invite tokens are 36-char lowercase UUIDs (UUID.randomUUID().toString()); match exactly
+    private static final Pattern INVITE_LINK_PATTERN =
+            Pattern.compile(
+                    "^/invite/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/?$");
 
     public static boolean isStaticResource(String requestURI) {
         return isStaticResource("", requestURI);
     }
 
     public static boolean isStaticResource(String contextPath, String requestURI) {
-        if (requestURI == null) {
+        String normalizedUri = normalizeUriOrNull(contextPath, requestURI);
+        if (normalizedUri == null) {
             return false;
         }
-
-        String normalizedUri = stripContextPath(contextPath, requestURI);
 
         // API routes are never static except for the public status endpoint
         if (normalizedUri.startsWith("/api/")) {
@@ -25,13 +45,11 @@ public class RequestUriUtils {
                 || normalizedUri.startsWith("/images/")
                 || normalizedUri.startsWith("/public/")
                 || normalizedUri.startsWith("/pdfjs/")
-                || normalizedUri.startsWith("/pdfjs-legacy/")
                 || normalizedUri.startsWith("/pdfium/")
                 || normalizedUri.startsWith("/assets/")
                 || normalizedUri.startsWith("/locales/")
                 || normalizedUri.startsWith("/Login/")
                 || normalizedUri.startsWith("/samples/")
-                || normalizedUri.startsWith("/classic-logo/")
                 || normalizedUri.startsWith("/modern-logo/")
                 || normalizedUri.startsWith("/og_images/")) {
             return true;
@@ -42,7 +60,6 @@ public class RequestUriUtils {
                 || "/favicon.ico".equals(normalizedUri)
                 || "/manifest.json".equals(normalizedUri)
                 || "/site.webmanifest".equals(normalizedUri)
-                || "/manifest-classic.json".equals(normalizedUri)
                 || "/index.html".equals(normalizedUri)) {
             return true;
         }
@@ -52,8 +69,20 @@ public class RequestUriUtils {
             return true;
         }
 
-        // Mobile scanner page for QR code-based file uploads (peer-to-peer, no backend auth needed)
-        if (normalizedUri.startsWith("/mobile-scanner")) {
+        // Mobile pages reached by scanning a QR code (peer-to-peer, no backend auth
+        // needed): /mobile-scanner uploads photos, /mobile-sign draws a signature.
+        if (normalizedUri.startsWith("/mobile-scanner")
+                || normalizedUri.startsWith("/mobile-sign")) {
+            return true;
+        }
+
+        // Admin portal SPA shell (mounted at /processor — must match the frontend
+        // PORTAL_BASENAME). Served publicly like the editor root so a direct nav /
+        // refresh to /processor loads the app (the JWT lives in localStorage, not a
+        // cookie, so the server can't authenticate the navigation itself). The
+        // portal gates access via its own auth gate + RequirePortalAccess, and its
+        // data APIs stay protected, so serving the shell pre-auth is safe.
+        if ("/processor".equals(normalizedUri) || normalizedUri.startsWith("/processor/")) {
             return true;
         }
 
@@ -72,11 +101,10 @@ public class RequestUriUtils {
     }
 
     public static boolean isFrontendRoute(String contextPath, String requestURI) {
-        if (requestURI == null) {
+        String normalizedUri = normalizeUriOrNull(contextPath, requestURI);
+        if (normalizedUri == null) {
             return false;
         }
-
-        String normalizedUri = stripContextPath(contextPath, requestURI);
 
         // APIs are never treated as frontend routes
         if (normalizedUri.startsWith("/api/")) {
@@ -97,7 +125,6 @@ public class RequestUriUtils {
             "/register",
             "/pipeline",
             "/pdfjs",
-            "/pdfjs-legacy",
             "/fonts",
             "/images",
             "/css",
@@ -157,11 +184,10 @@ public class RequestUriUtils {
      * @return true if the endpoint is public and doesn't require authentication
      */
     public static boolean isPublicAuthEndpoint(String requestURI, String contextPath) {
-        // Remove context path from URI to normalize path matching
-        String trimmedUri =
-                requestURI.startsWith(contextPath)
-                        ? requestURI.substring(contextPath.length())
-                        : requestURI;
+        String trimmedUri = normalizeUriOrNull(contextPath, requestURI);
+        if (trimmedUri == null) {
+            return false;
+        }
 
         // Public auth endpoints that don't require authentication
         return trimmedUri.startsWith("/login")
@@ -186,19 +212,45 @@ public class RequestUriUtils {
                 || trimmedUri.startsWith("/healthz")
                 || trimmedUri.startsWith("/liveness")
                 || trimmedUri.startsWith("/readiness")
-                || trimmedUri.startsWith(
-                        "/api/v1/mobile-scanner/") // Mobile scanner endpoints (no auth)
+                // The phone that scans the QR code has no credentials
+                || MOBILE_SCANNER_PHONE_PATTERN.matcher(trimmedUri).matches()
+                || trimmedUri.startsWith("/api/v1/webhooks/")
+                || trimmedUri.startsWith("/api/v1/connected-accounts/callback/")
                 || trimmedUri.startsWith("/v1/api-docs")
                 // Workflow participant endpoints - access controlled by share tokens, not login
                 || trimmedUri.startsWith("/api/v1/workflow/participant/")
                 // Share-link SPA bootstrap; data APIs remain protected
-                || trimmedUri.matches("^/share/[^/]+/?$");
+                || SHARE_LINK_PATTERN.matcher(trimmedUri).matches()
+                // Share-link download; the service still demands login unless the link is public
+                || SHARE_LINK_API_PATTERN.matcher(trimmedUri).matches()
+                // Invite-accept SPA bootstrap; data APIs remain protected
+                || INVITE_LINK_PATTERN.matcher(trimmedUri).matches();
     }
 
-    private static String stripContextPath(String contextPath, String requestURI) {
-        if (contextPath != null && !contextPath.isBlank() && requestURI.startsWith(contextPath)) {
-            return requestURI.substring(contextPath.length());
+    public static String normalizeUri(String contextPath, String requestURI) {
+        String decodedUri = UriUtils.decode(requestURI, StandardCharsets.UTF_8);
+        if (contextPath != null && !contextPath.isBlank()) {
+            String decodedContextPath = UriUtils.decode(contextPath, StandardCharsets.UTF_8);
+            if (decodedUri.startsWith(decodedContextPath)) {
+                return decodedUri.substring(decodedContextPath.length());
+            }
         }
-        return requestURI;
+        return decodedUri;
+    }
+
+    public static boolean isApiRequest(String contextPath, String requestURI) {
+        String normalizedUri = normalizeUriOrNull(contextPath, requestURI);
+        return normalizedUri == null || normalizedUri.startsWith("/api/");
+    }
+
+    private static String normalizeUriOrNull(String contextPath, String requestURI) {
+        if (requestURI == null) {
+            return null;
+        }
+        try {
+            return normalizeUri(contextPath, requestURI);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 }

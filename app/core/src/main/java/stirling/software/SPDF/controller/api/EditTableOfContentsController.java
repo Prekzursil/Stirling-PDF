@@ -1,14 +1,19 @@
 package stirling.software.SPDF.controller.api;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
+import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineNode;
 import org.springframework.core.io.Resource;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -26,6 +31,8 @@ import stirling.software.SPDF.model.api.EditTableOfContentsRequest;
 import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.GeneralApi;
 import stirling.software.common.enumeration.ResourceWeight;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.GeneralUtils;
 import stirling.software.common.util.TempFileManager;
@@ -39,6 +46,8 @@ import tools.jackson.databind.ObjectMapper;
 @RequiredArgsConstructor
 public class EditTableOfContentsController {
 
+    private static final int MAX_OUTLINE_DEPTH = 64;
+
     private final CustomPDFDocumentFactory pdfDocumentFactory;
     private final ObjectMapper objectMapper;
     private final TempFileManager tempFileManager;
@@ -47,6 +56,7 @@ public class EditTableOfContentsController {
             value = "/extract-bookmarks",
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             resourceWeight = ResourceWeight.SMALL_WEIGHT)
+    @ToolIO(produces = ToolFormat.JSON)
     @Operation(
             summary = "Extract PDF Bookmarks",
             description = "Extracts bookmarks/table of contents from a PDF document as JSON.")
@@ -67,90 +77,43 @@ public class EditTableOfContentsController {
 
     private List<Map<String, Object>> extractBookmarkItems(
             PDDocument document, PDDocumentOutline outline) throws Exception {
-        List<Map<String, Object>> bookmarks = new ArrayList<>();
-        PDOutlineItem current = outline.getFirstChild();
-
-        while (current != null) {
-            Map<String, Object> bookmark = new HashMap<>();
-
-            // Get bookmark title
-            String title = current.getTitle();
-            bookmark.put("title", title);
-
-            // Get page number (1-based for UI purposes)
-            PDPage page = current.findDestinationPage(document);
-            if (page != null) {
-                int pageIndex = document.getPages().indexOf(page);
-                bookmark.put("pageNumber", pageIndex + 1);
-            } else {
-                bookmark.put("pageNumber", 1);
-            }
-
-            // Process children if any
-            PDOutlineItem child = current.getFirstChild();
-            if (child != null) {
-                List<Map<String, Object>> children = new ArrayList<>();
-
-                while (child != null) {
-                    // Recursively process child items
-                    Map<String, Object> childBookmark = processChild(document, child);
-                    children.add(childBookmark);
-                    child = child.getNextSibling();
-                }
-
-                bookmark.put("children", children);
-            } else {
-                bookmark.put("children", new ArrayList<>());
-            }
-
-            bookmarks.add(bookmark);
-            current = current.getNextSibling();
-        }
-
-        return bookmarks;
+        return processChildren(
+                document, outline, Collections.newSetFromMap(new IdentityHashMap<>()), 0);
     }
 
-    private Map<String, Object> processChild(PDDocument document, PDOutlineItem item)
+    /**
+     * Outline links come from the file and can form cycles through /Next or /First, so each item is
+     * emitted once and nesting is capped.
+     */
+    private List<Map<String, Object>> processChildren(
+            PDDocument document, PDOutlineNode parent, Set<COSDictionary> visited, int depth)
             throws Exception {
-        Map<String, Object> bookmark = new HashMap<>();
-
-        // Get bookmark title
-        String title = item.getTitle();
-        bookmark.put("title", title);
-
-        // Get page number (1-based for UI purposes)
-        PDPage page = item.findDestinationPage(document);
-        if (page != null) {
-            int pageIndex = document.getPages().indexOf(page);
-            bookmark.put("pageNumber", pageIndex + 1);
-        } else {
-            bookmark.put("pageNumber", 1);
+        List<Map<String, Object>> children = new ArrayList<>();
+        if (depth > MAX_OUTLINE_DEPTH) {
+            return children;
         }
-
-        // Process children if any
-        PDOutlineItem child = item.getFirstChild();
-        if (child != null) {
-            List<Map<String, Object>> children = new ArrayList<>();
-
-            while (child != null) {
-                // Recursively process child items
-                Map<String, Object> childBookmark = processChild(document, child);
-                children.add(childBookmark);
-                child = child.getNextSibling();
+        for (PDOutlineItem item : parent.children()) {
+            if (!visited.add(item.getCOSObject())) {
+                continue;
             }
+            Map<String, Object> bookmark = new HashMap<>();
+            bookmark.put("title", item.getTitle());
 
-            bookmark.put("children", children);
-        } else {
-            bookmark.put("children", new ArrayList<>());
+            // 1-based for the UI
+            PDPage page = item.findDestinationPage(document);
+            bookmark.put("pageNumber", page != null ? document.getPages().indexOf(page) + 1 : 1);
+
+            bookmark.put("children", processChildren(document, item, visited, depth + 1));
+            children.add(bookmark);
         }
-
-        return bookmark;
+        return children;
     }
 
     @AutoJobPostMapping(
             value = "/edit-table-of-contents",
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             resourceWeight = ResourceWeight.SMALL_WEIGHT)
+    @ToolIO(produces = ToolFormat.PDF)
     @Operation(
             summary = "Edit Table of Contents",
             description = "Add or edit bookmarks/table of contents in a PDF document.")
@@ -174,7 +137,7 @@ public class EditTableOfContentsController {
 
             return WebResponseUtils.pdfDocToWebResponse(
                     document,
-                    GeneralUtils.generateFilename(file.getOriginalFilename(), "_with_toc.pdf"),
+                    GeneralUtils.generateFilename(file.getOriginalFilename(), ".pdf"),
                     tempFileManager);
         }
     }

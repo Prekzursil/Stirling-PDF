@@ -29,6 +29,9 @@ import stirling.software.SPDF.model.api.general.SplitPdfBySizeOrCountRequest;
 import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.GeneralApi;
 import stirling.software.common.enumeration.ResourceWeight;
+import stirling.software.common.model.tool.ToolArity;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.ExceptionUtils;
 import stirling.software.common.util.FormUtils;
@@ -52,17 +55,20 @@ public class SplitPdfBySizeController {
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             resourceWeight = ResourceWeight.MEDIUM_WEIGHT)
     @MultiFileResponse
+    @ToolIO(produces = ToolFormat.PDF, arity = ToolArity.SIMO)
     @Operation(
             summary = "Auto split PDF pages into separate documents based on size or count",
             description =
                     "split PDF into multiple paged documents based on size/count, ie if 20 pages"
-                            + " and split into 5, it does 5 documents each 4 pages\r\n"
-                            + " if 10MB and each page is 1MB and you enter 2MB then 5 docs each 2MB"
-                            + " (rounded so that it accepts 1.9MB but not 2.1MB) Input:PDF"
-                            + " Output:ZIP-PDF Type:SISO")
+                            + " and split into 5, it does 5 documents each 4 pages\r\n if 10MB and each page"
+                            + " is 1MB and you enter 2MB then 5 docs each 2MB (rounded so that it accepts"
+                            + " 1.9MB but not 2.1MB)")
     public ResponseEntity<Resource> autoSplitPdf(
             @ModelAttribute SplitPdfBySizeOrCountRequest request) throws Exception {
 
+        if (request.getSplitType() == 1 || request.getSplitType() == 2) {
+            requirePositiveCount(request.getSplitValue());
+        }
         MultipartFile file = request.getFileInput();
         String filename = GeneralUtils.generateFilename(file.getOriginalFilename(), "");
 
@@ -109,6 +115,18 @@ public class SplitPdfBySizeController {
         }
     }
 
+    private static int requirePositiveCount(String value) {
+        try {
+            int count = Integer.parseInt(value);
+            if (count > 0) return count;
+        } catch (NumberFormatException ignored) {
+        }
+        throw ExceptionUtils.createIllegalArgumentException(
+                ExceptionUtils.ErrorCode.INVALID_ARGUMENT,
+                "splitValue",
+                "must be a positive integer for page-count or document-count splitting");
+    }
+
     private List<int[]> computeRanges(SplitPdfBySizeOrCountRequest request, PdfDocument sourceDoc)
             throws IOException {
         int type = request.getSplitType();
@@ -116,9 +134,9 @@ public class SplitPdfBySizeController {
         if (type == 0) {
             return computeSizeRanges(sourceDoc, GeneralUtils.convertSizeToBytes(value));
         } else if (type == 1) {
-            return computePageCountRanges(sourceDoc, Integer.parseInt(value));
+            return computePageCountRanges(sourceDoc, requirePositiveCount(value));
         } else if (type == 2) {
-            return computeDocCountRanges(sourceDoc, Integer.parseInt(value));
+            return computeDocCountRanges(sourceDoc, requirePositiveCount(value));
         }
         throw ExceptionUtils.createIllegalArgumentException(
                 "error.invalidArgument", "Invalid argument: {0}", "split type: " + type);

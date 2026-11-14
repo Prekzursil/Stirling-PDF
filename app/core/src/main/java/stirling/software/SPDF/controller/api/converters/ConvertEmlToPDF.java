@@ -22,11 +22,15 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 import stirling.software.SPDF.config.swagger.StandardPdfResponse;
+import stirling.software.SPDF.service.OfficeConversionService;
+import stirling.software.SPDF.service.OfficeToPdfService;
 import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.ConvertApi;
 import stirling.software.common.configuration.RuntimePathConfig;
 import stirling.software.common.enumeration.ResourceWeight;
 import stirling.software.common.model.api.converters.EmlToPdfRequest;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.CustomHtmlSanitizer;
 import stirling.software.common.util.EmlToPdf;
@@ -43,19 +47,22 @@ public class ConvertEmlToPDF {
     private final RuntimePathConfig runtimePathConfig;
     private final TempFileManager tempFileManager;
     private final CustomHtmlSanitizer customHtmlSanitizer;
+    private final OfficeConversionService officeConversionService;
+    private final OfficeToPdfService officeToPdfService;
 
     @AutoJobPostMapping(
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             value = "/eml/pdf",
             resourceWeight = ResourceWeight.LARGE_WEIGHT)
     @StandardPdfResponse
+    @ToolIO(accepts = ToolFormat.EMAIL, produces = ToolFormat.PDF)
     @Operation(
             summary = "Convert EML/MSG to PDF",
             description =
-                    "This endpoint converts EML (email) and MSG (Outlook) files to PDF format"
-                            + " with extensive customization options. Features include font settings,"
-                            + " image constraints, display modes, attachment handling, and HTML debug"
-                            + " output. Input: EML or MSG file, Output: PDF or HTML file. Type: SISO")
+                    "This endpoint converts EML (email) and MSG (Outlook) files to PDF format with"
+                            + " extensive customization options. Features include font settings, image"
+                            + " constraints, display modes, attachment handling, and HTML debug output. or MSG"
+                            + " file, or HTML file.")
     public ResponseEntity<Resource> convertEmlToPdf(@ModelAttribute EmlToPdfRequest request) {
 
         MultipartFile inputFile = request.getFileInput();
@@ -100,23 +107,36 @@ public class ConvertEmlToPDF {
                             tempOut, baseFilename + ".html", MediaType.TEXT_HTML);
                 } catch (IOException | IllegalArgumentException e) {
                     log.error("HTML conversion failed for {}", originalFilename, e);
+                    String detail =
+                            e.getMessage() == null
+                                    ? "Unknown error"
+                                    : HtmlUtils.htmlEscape(e.getMessage());
                     return errorResponse(
-                            HttpStatus.INTERNAL_SERVER_ERROR,
-                            "HTML conversion failed: " + e.getMessage());
+                            HttpStatus.INTERNAL_SERVER_ERROR, "HTML conversion failed: " + detail);
                 }
             }
 
-            // Convert EML/MSG to PDF with enhanced options
             try {
                 byte[] pdfBytes =
-                        EmlToPdf.convertEmlToPdf(
-                                runtimePathConfig.getWeasyPrintPath(),
-                                request,
-                                fileBytes,
-                                originalFilename,
-                                pdfDocumentFactory,
-                                tempFileManager,
-                                customHtmlSanitizer);
+                        officeConversionService.replacesLibreOffice(
+                                        request.getUseStirlingOfficeConvert())
+                                ? EmlToPdf.convertEmlToPdf(
+                                        request,
+                                        fileBytes,
+                                        pdfDocumentFactory,
+                                        customHtmlSanitizer,
+                                        html ->
+                                                officeToPdfService.convertHtml(
+                                                        html.getBytes(StandardCharsets.UTF_8),
+                                                        false))
+                                : EmlToPdf.convertEmlToPdf(
+                                        runtimePathConfig.getWeasyPrintPath(),
+                                        request,
+                                        fileBytes,
+                                        originalFilename,
+                                        pdfDocumentFactory,
+                                        tempFileManager,
+                                        customHtmlSanitizer);
 
                 if (pdfBytes == null || pdfBytes.length == 0) {
                     log.error("PDF conversion failed - empty output for {}", originalFilename);
@@ -147,7 +167,7 @@ public class ConvertEmlToPDF {
                         errorMessage,
                         e);
                 return errorResponse(HttpStatus.INTERNAL_SERVER_ERROR, errorMessage);
-            } catch (RuntimeException e) {
+            } catch (IOException | RuntimeException e) {
                 String errorMessage = buildErrorMessage(e, originalFilename);
                 log.error(
                         "Email to PDF conversion failed for {}: {}",
@@ -163,9 +183,11 @@ public class ConvertEmlToPDF {
         }
     }
 
+    /** Error bodies are plain text whatever the request negotiates. */
     private ResponseEntity<Resource> errorResponse(HttpStatus status, String message) {
         byte[] body = message.getBytes(StandardCharsets.UTF_8);
         return ResponseEntity.status(status)
+                .contentType(new MediaType(MediaType.TEXT_PLAIN, StandardCharsets.UTF_8))
                 .contentLength(body.length)
                 .body(new ByteArrayResource(body));
     }

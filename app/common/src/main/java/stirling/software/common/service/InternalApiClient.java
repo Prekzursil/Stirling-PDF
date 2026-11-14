@@ -8,6 +8,7 @@ import java.nio.file.Files;
 import java.time.Duration;
 import java.util.regex.Pattern;
 
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.env.Environment;
 import org.springframework.core.io.FileSystemResource;
@@ -45,10 +46,19 @@ public class InternalApiClient {
     // The second alternation carves out `/api/v1/ai/tools/*` specifically — AI tools are
     // dispatchable, but the broader `/api/v1/ai/` surface (orchestrate, health, etc.) is
     // intentionally NOT permitted to avoid plan steps re-entering the orchestrator.
+    //
+    // `/api/v1/integration/*` holds third-party steps (external API call, Purview labelling,
+    // ConsignO). They reach outside the JVM, so the namespace is deliberately kept to tools that
+    // dereference an admin-owned connection rather than a caller-supplied host — see
+    // ApiConnectionResolver.
+    //
+    // Of `/api/v1/form/*` only filling and listing fields are dispatchable; the editor's own
+    // field editing endpoints stay out.
     private static final Pattern ALLOWED_ENDPOINT_PATH =
             Pattern.compile(
-                    "^/api/v1/(general|misc|security|convert|filter)(/[A-Za-z0-9_-]+)+$"
-                            + "|^/api/v1/ai/tools(/[A-Za-z0-9_-]+)+$");
+                    "^/api/v1/(general|misc|security|convert|filter|integration|docparse)(/[A-Za-z0-9_-]+)+$"
+                            + "|^/api/v1/ai/tools(/[A-Za-z0-9_-]+)+$"
+                            + "|^/api/v1/form/(fill|fields)$");
 
     /**
      * Marker propagated on every internal sub-step dispatch so the saas PAYG interceptor classifies
@@ -59,6 +69,17 @@ public class InternalApiClient {
      * per-tool {@code @RequiresFeature} annotation.
      */
     public static final String AUTOMATION_HEADER = "X-Stirling-Automation";
+
+    /**
+     * Header carrying the parent policy's name onto each sub-step dispatch, read from MDC key
+     * {@link #POLICY_NAME_MDC_KEY} (set by the policy runner on the worker thread). Lets the audit
+     * layer attribute a tool step to the policy that ran it, instead of showing it as a bare direct
+     * call.
+     */
+    public static final String POLICY_NAME_HEADER = "X-Stirling-Policy-Name";
+
+    /** MDC key the policy runner stamps with the running policy's name; forwarded as a header. */
+    public static final String POLICY_NAME_MDC_KEY = "auditPolicyName";
 
     private final ServletContext servletContext;
     private final UserServiceInterface userService;
@@ -111,16 +132,41 @@ public class InternalApiClient {
         // step inside a policy run must bill as AUTOMATION, not AI). Set unconditionally because
         // every caller of this dispatcher is an automation surface by design.
         headers.add(AUTOMATION_HEADER, "true");
+        // Propagate the current automation run id (set by the orchestrator around its dispatch
+        // loop) so the PAYG interceptor groups every sub-step of this one run into a single charge,
+        // and never merges two separate runs that happen to touch identical bytes. Absent → the
+        // receiving call is treated as standalone. See AutomationRunContext.
+        String runId = AutomationRunContext.current();
+        if (runId != null && !runId.isEmpty()) {
+            headers.add(AutomationRunContext.RUN_ID_HEADER, runId);
+        }
+        // Each source document gets its own charge grouping and step allowance on a linked
+        // instance. SaaS groups by lineage instead.
+        String documentId = AutomationRunContext.currentDocument();
+        if (documentId != null && !documentId.isEmpty()) {
+            headers.add(AutomationRunContext.DOCUMENT_ID_HEADER, documentId);
+        }
 
-        // A no-file ai/tools call (e.g. create-pdf-from-html-agent) sends only string params, so
-        // without this RestTemplate would use urlencoded instead of the multipart the controller
-        // expects. File-bearing calls get the right multipart content-type from RestTemplate.
-        boolean isAiTool = endpointPath.startsWith("/api/v1/ai/tools/");
+        // Forward the parent policy name (set in MDC by the policy runner) so the audited sub-step
+        // ties back to its policy. Single-line, length-capped: it becomes an HTTP header value.
+        String policyName = MDC.get(POLICY_NAME_MDC_KEY);
+        if (policyName != null && !policyName.isBlank()) {
+            String safe = policyName.replaceAll("[\\r\\n]", " ").trim();
+            if (safe.length() > 200) {
+                safe = safe.substring(0, 200);
+            }
+            if (!safe.isEmpty()) {
+                headers.add(POLICY_NAME_HEADER, safe);
+            }
+        }
+
+        // This dispatcher sends multipart forms. Without a Resource part, RestTemplate would
+        // choose urlencoded instead, even for generators such as /api/v1/convert/url/pdf.
         boolean hasFilePart =
                 body.values().stream()
                         .flatMap(java.util.List::stream)
-                        .anyMatch(v -> v instanceof Resource);
-        if (isAiTool && !hasFilePart) {
+                        .anyMatch(Resource.class::isInstance);
+        if (!hasFilePart) {
             headers.setContentType(MediaType.MULTIPART_FORM_DATA);
         }
         HttpEntity<MultiValueMap<String, Object>> entity = new HttpEntity<>(body, headers);
@@ -135,15 +181,22 @@ public class InternalApiClient {
                         try {
                             TempFile tempFile =
                                     tempFileManager.createManagedTempFile("internal-api");
-                            Files.copy(
-                                    response.getBody(),
-                                    tempFile.getPath(),
-                                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                            String filename = extractFilename(response.getHeaders());
-                            TempFileResource resource = new TempFileResource(tempFile, filename);
-                            return ResponseEntity.status(response.getStatusCode())
-                                    .headers(response.getHeaders())
-                                    .body(resource);
+                            try {
+                                Files.copy(
+                                        response.getBody(),
+                                        tempFile.getPath(),
+                                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                                String filename = extractFilename(response.getHeaders());
+                                TempFileResource resource =
+                                        new TempFileResource(tempFile, filename);
+                                return ResponseEntity.status(response.getStatusCode())
+                                        .headers(response.getHeaders())
+                                        .body(resource);
+                            } catch (IOException | RuntimeException e) {
+                                // The caller never receives this file, so nobody else can delete it
+                                tempFile.close();
+                                throw e;
+                            }
                         } catch (IOException e) {
                             throw new UncheckedIOException(e);
                         }
@@ -203,8 +256,13 @@ public class InternalApiClient {
         return userService.getApiKeyForUser(Role.INTERNAL_API_USER.getRoleId());
     }
 
+    /** Whether {@link #post} would dispatch to this path rather than refuse it. */
+    public static boolean isDispatchable(String endpointPath) {
+        return endpointPath != null && ALLOWED_ENDPOINT_PATH.matcher(endpointPath).matches();
+    }
+
     private void validateUrl(String endpointPath) {
-        if (endpointPath == null || !ALLOWED_ENDPOINT_PATH.matcher(endpointPath).matches()) {
+        if (!isDispatchable(endpointPath)) {
             log.warn("Blocked internal API request to disallowed path: {}", endpointPath);
             throw new SecurityException(
                     "Internal API dispatch not permitted for endpoint: " + endpointPath);

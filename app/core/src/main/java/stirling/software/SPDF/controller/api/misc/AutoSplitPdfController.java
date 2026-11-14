@@ -41,9 +41,14 @@ import stirling.software.common.annotations.AutoJobPostMapping;
 import stirling.software.common.annotations.api.MiscApi;
 import stirling.software.common.enumeration.ResourceWeight;
 import stirling.software.common.model.ApplicationProperties;
+import stirling.software.common.model.tool.ToolArity;
+import stirling.software.common.model.tool.ToolFormat;
+import stirling.software.common.model.tool.ToolIO;
 import stirling.software.common.service.CustomPDFDocumentFactory;
 import stirling.software.common.util.ExceptionUtils;
 import stirling.software.common.util.GeneralUtils;
+import stirling.software.common.util.ImageMemoryLimit;
+import stirling.software.common.util.LimitedPDFRenderer;
 import stirling.software.common.util.TempFile;
 import stirling.software.common.util.TempFileManager;
 import stirling.software.common.util.WebResponseUtils;
@@ -63,6 +68,10 @@ public class AutoSplitPdfController {
 
     // 150 DPI is sufficient for QR code detection — higher wastes memory and CPU
     private static final int QR_DETECTION_DPI = 150;
+
+    // Ceiling for the retry pass. 300 DPI decodes every divider size 500 does, including a 10mm
+    // code under blur, noise and skew, at a quarter of the pixels.
+    private static final int QR_RETRY_DPI = 300;
 
     // Max total pixels before we downscale to avoid OOM on getRGB() allocation
     private static final long MAX_IMAGE_PIXELS = 100_000_000L; // ~10000x10000
@@ -207,20 +216,12 @@ public class AutoSplitPdfController {
                 continue;
             }
             PDImageXObject imageObject = (PDImageXObject) page.getResources().getXObject(name);
-
-            BufferedImage image;
-            try {
-                image = imageObject.getImage();
-            } catch (OutOfMemoryError e) {
-                log.warn(
-                        "Skipping oversized embedded image '{}' ({}x{}) - out of memory",
-                        name.getName(),
-                        imageObject.getWidth(),
-                        imageObject.getHeight());
+            if (!ImageMemoryLimit.embeddedImageFits(imageObject)) {
+                log.warn("Skipping embedded image '{}': over the image limit", name.getName());
                 continue;
             }
 
-            String result = decodeQRCode(image);
+            String result = decodeQRCode(imageObject.getImage());
             if (result != null) {
                 return result;
             }
@@ -230,8 +231,8 @@ public class AutoSplitPdfController {
 
     /**
      * Render the full page to an image and scan it for a QR code. Tries a low DPI first (fast, low
-     * memory) and only retries at the system's maxDPI if detection fails. The first rendered image
-     * is released before the retry to allow GC to reclaim it.
+     * memory) and only retries at {@link #QR_RETRY_DPI} if detection fails. The first rendered
+     * image is released before the retry to allow GC to reclaim it.
      */
     private String checkPageByRendering(PDFRenderer pdfRenderer, int pageNum) throws IOException {
         log.debug("Rendering page {} at {} DPI for QR detection", pageNum + 1, QR_DETECTION_DPI);
@@ -245,17 +246,17 @@ public class AutoSplitPdfController {
         bim = null; // allow GC before potential high-DPI retry
 
         if (result == null) {
-            int maxDpi = getSystemMaxDpi();
-            if (maxDpi > QR_DETECTION_DPI) {
+            int retryDpi = Math.min(getSystemMaxDpi(), QR_RETRY_DPI);
+            if (retryDpi > QR_DETECTION_DPI) {
                 log.debug(
                         "Retrying page {} at {} DPI (low-DPI detection failed)",
                         pageNum + 1,
-                        maxDpi);
+                        retryDpi);
                 BufferedImage highRes =
                         ExceptionUtils.handleOomRendering(
                                 pageNum + 1,
-                                maxDpi,
-                                () -> pdfRenderer.renderImageWithDPI(pageNum, maxDpi));
+                                retryDpi,
+                                () -> pdfRenderer.renderImageWithDPI(pageNum, retryDpi));
                 result = decodeQRCode(highRes);
             }
         }
@@ -274,13 +275,15 @@ public class AutoSplitPdfController {
             consumes = MediaType.MULTIPART_FORM_DATA_VALUE,
             resourceWeight = ResourceWeight.SMALL_WEIGHT)
     @MultiFileResponse
+    @ToolIO(produces = ToolFormat.PDF, arity = ToolArity.SIMO)
     @Operation(
-            summary = "Auto split PDF pages into separate documents",
+            summary = "Split a PDF at Stirling QR-code divider pages",
             description =
-                    "This endpoint accepts a PDF file, scans each page for a specific QR code, and"
-                            + " splits the document at the QR code boundaries. The output is a zip"
-                            + " file containing each separate PDF document. Input:PDF Output:ZIP-PDF"
-                            + " Type:SISO")
+                    "Splits at each divider page and returns a zip of the parts. Divider"
+                            + " pages are dropped except a divider on page 1, which is retained."
+                            + " duplexMode=true also drops each divider's back page, including"
+                            + " when the divider is retained. With no dividers you get one file; use split-pages or"
+                            + " split-by-size-or-count instead.")
     public ResponseEntity<Resource> autoSplitPdf(@ModelAttribute AutoSplitPdfRequest request)
             throws IOException {
         MultipartFile file = request.getFileInput();
@@ -298,7 +301,7 @@ public class AutoSplitPdfController {
             int totalPages = document.getNumberOfPages();
             log.info("PDF loaded, totalPages={}", totalPages);
 
-            PDFRenderer pdfRenderer = new PDFRenderer(document);
+            PDFRenderer pdfRenderer = new LimitedPDFRenderer(document);
             pdfRenderer.setSubsamplingAllowed(true);
 
             for (int page = 0; page < totalPages; ++page) {
@@ -333,7 +336,7 @@ public class AutoSplitPdfController {
                 }
 
                 if (!splitDocuments.isEmpty() && !isValidQrCode) {
-                    splitDocuments.get(splitDocuments.size() - 1).addPage(document.getPage(page));
+                    splitDocuments.getLast().addPage(document.getPage(page));
                 } else if (page == 0) {
                     PDDocument firstDocument = new PDDocument();
                     firstDocument.addPage(document.getPage(page));
