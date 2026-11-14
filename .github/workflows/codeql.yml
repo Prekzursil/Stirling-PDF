@@ -1,0 +1,75 @@
+# Advanced Code Scanning (CodeQL) — fleet security standard.
+# security-extended + security-and-quality strictly subsumes the default suite
+# and the extended suite. Matrix covers every language this repository has:
+# java-kotlin (Gradle backend), javascript-typescript (frontend + devTools),
+# rust (Tauri desktop editor). The repository's own suite (build.yml router)
+# stays wired in CI beside this workflow.
+name: CodeQL Advanced
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "33 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      # required for all features
+      security-events: write
+      # only required for workflows in private repositories
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: java-kotlin
+            build-mode: manual
+          - language: javascript-typescript
+            build-mode: none
+          - language: rust
+            build-mode: manual
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended,security-and-quality
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Build backend (Java, traced by CodeQL)
+        if: matrix.language == 'java-kotlin'
+        env:
+          STIRLING_FLAVOR: core
+        run: |
+          ./gradlew assemble --no-daemon -PnoSpotless
+
+      - name: Install Tauri system dependencies (Rust)
+        if: matrix.language == 'rust'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Build Tauri editor (Rust, traced by CodeQL)
+        if: matrix.language == 'rust'
+        working-directory: frontend/editor/src-tauri
+        run: cargo build
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
