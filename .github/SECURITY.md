@@ -63,3 +63,22 @@ When deploying Stirling-PDF:
 1. Always use the latest version
 2. Follow our deployment guidelines
 3. Regularly check for and apply updates
+
+## Documented residual risks (no fixed release reachable in this tree)
+
+Verified 2026-11-19 against the crates.io / npm registry dependency APIs.
+None of these are dismissed or muted; each is blocked by an upstream
+release that does not exist yet.
+
+### `extract-zip` 2.0.1 (2 Dependabot alerts; advisory covers <= 2.0.1)
+- Chain: `@puppeteer/browsers` -> `extract-zip ^2.0.1`. `2.0.1` is the
+  NEWEST published release (`npm view extract-zip dist-tags.latest`), and
+  the advisory has no patched version. Reached only when Puppeteer
+  downloads a browser during development; unfixable until upstream
+  publishes a fix.
+
+### `glib` 0.18.5 (1 Dependabot alert; fix 0.20.0)
+- Chain: `tauri 2.12.7` (latest stable) -> `gtk ^0.18` -> `glib ^0.18`.
+  The `gtk` crate's newest release (0.19.0) requires `glib ^0.22`, and no
+  tauri release accepts gtk 0.19+, so `glib >= 0.20` is unreachable from
+  any tauri-based tree today. Linux-desktop-only dependency.
