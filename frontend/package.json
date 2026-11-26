@@ -175,6 +175,7 @@
     "devalue": "^5.9.4",
     "pako": "^2.2.0",
     "basic-ftp": "^6.2.4",
+    "@vitest/mocker": "^4.1.12",
     "@joshwooding/vite-plugin-react-docgen-typescript": {
       "glob": {
         "minimatch": "^11.0.9"
